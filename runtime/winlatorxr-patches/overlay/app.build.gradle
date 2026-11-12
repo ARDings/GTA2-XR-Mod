@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+android {
+    namespace 'com.winlator.cmod'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.gta2ceiling.winlator'
+        minSdkVersion 26
+        targetSdkVersion 28
+        versionCode 1
+        versionName 'gcc-room-1-dawn42-experimental'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    signingConfigs { debug { storeFile file('../../gcc-debug.keystore') } }
+    buildTypes { debug { minifyEnabled false } }
+    kotlinOptions { jvmTarget = '17' }
+    sourceSets { main { jniLibs.srcDirs = ['src/main/jniLibs', '../../native-build/jniLibs']; assets.srcDirs = [] } }
+    packagingOptions { jniLibs { useLegacyPackaging = true } }
+    lint { checkReleaseBuilds false; abortOnError false }
+}
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.4.0'
+    implementation 'androidx.preference:preference:1.2.1'
+    implementation 'com.google.android.material:material:1.6.1'
+    implementation 'com.github.luben:zstd-jni:1.5.2-3@aar'
+    implementation 'org.tukaani:xz:1.7'
+    implementation 'org.apache.commons:commons-compress:1.20'
+    implementation 'androidx.activity:activity-ktx:1.4.0'
+    implementation 'androidx.fragment:fragment-ktx:1.4.0'
+    implementation files('libs/MidiSynth/MidiSynth.jar')
+    implementation files('libs/Haptics/haptic_service.aar')
+    implementation 'androidx.recyclerview:recyclerview:1.2.0'
+    implementation 'com.squareup.retrofit2:retrofit:2.9.0'
+    implementation 'com.squareup.retrofit2:converter-gson:2.9.0'
+    implementation 'com.google.code.gson:gson:2.8.8'
+    implementation 'org.conscrypt:conscrypt-android:2.5.2'
+    implementation 'org.bouncycastle:bcprov-jdk15on:1.68'
+    implementation 'org.openjsse:openjsse:1.1.7'
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'com.github.bumptech.glide:glide:4.11.0'
+    annotationProcessor 'com.github.bumptech.glide:compiler:4.11.0'
+    implementation 'com.kohlschutter.junixsocket:junixsocket-common:2.6.0'
+    implementation 'com.kohlschutter.junixsocket:junixsocket-native-common:2.6.0'
+    implementation 'com.google.android.flexbox:flexbox:3.0.0'
+    implementation files('libs/JavaSteam/javasteam-1.8.0.1-18-SNAPSHOT.jar')
+    implementation files('libs/JavaSteam/javasteam-depotdownloader-1.8.0.1-18-SNAPSHOT.jar')
+    implementation 'com.google.protobuf:protobuf-java:4.34.1'
+    implementation 'com.google.zxing:core:3.5.4'
+    implementation 'com.squareup.okhttp3:okhttp:5.3.2'
+    implementation 'com.squareup.okhttp3:okhttp-coroutines:5.3.2'
+    implementation 'com.squareup.okio:okio:3.17.0'
+    implementation 'org.apache.commons:commons-lang3:3.20.0'
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.2.20'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-jdk8:1.11.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-serialization-core:1.9.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0'
+}

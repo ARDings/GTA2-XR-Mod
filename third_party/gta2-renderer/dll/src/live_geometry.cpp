@@ -1,0 +1,1654 @@
+#include "live_geometry.h"
+#include "../../src/dynamic_draw.h"
+#include "../../../../src/mod/graphics_quality.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <utility>
+
+#include "../../src/gta2_map.h"
+#include "../../src/renderer.h"
+#include "game_access.h"
+#include "gibs.h"
+#include "log.h"
+#include "overlay.h"
+#include "texture_store.h"
+
+namespace gta2dx9 {
+namespace {
+
+constexpr DWORD kWorldFvf = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1;
+constexpr DWORD kBatchFvf = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+constexpr int kGameVertexFloats = 8;
+constexpr int kUvU = 6;
+constexpr int kUvV = 7;
+
+// How far a sprite is lifted off the floor it stands on.
+//
+// GTA2 itself lifts them by nothing at all. Its object pass puts all four
+// corners of the quad at exactly the level of the block underneath - read back
+// out of the game's own vertex shadow, a pedestrian at cell (158,138) comes out
+// as (158.2656 138.7500 2.0000) (158.2656 138.2500 2.0000) (158.7344 138.2500
+// 2.0000) (158.7344 138.7500 2.0000), all four at 2.0000, while the floor there
+// is the lid at 2.0. Perfectly coplanar.
+//
+// It gets away with that because its renderers never depth test: 3dfx.dll calls
+// grDepthBufferFunction(GR_CMP_ALWAYS) and imports no grDepthMask or
+// grDepthBufferMode at all, and d3ddll.dll never sets ZENABLE, ZWRITEENABLE or
+// ZFUNC. Both are pure painter's algorithm - the map is drawn level by level and
+// the object pass paints over the floor it just laid down. That is also why the
+// screen-space overlay pass never had this problem: it replays submission order
+// with no depth test, which is the original behaviour exactly.
+//
+// Turning a sprite into real 3D geometry is what breaks it. Coplanar surfaces
+// have no defined order in 3D: the depth test drops them, and under Remix the
+// ray hit is ambiguous however the raster state is set, so ZFUNC_LESSEQUAL would
+// fix the raster view and still leave the path tracer fighting itself.
+//
+// So the lift is ours and has to be justified rather than guessed.
+//
+// A quarter of a ground texel - 1/256 of a block, the first value used here -
+// is enough to break the coplanarity and nothing more. That settles flat
+// ground, and does nothing at all for a slope: GTA2 gives all four corners of
+// the quad the object's single level, so on a ramp a horizontal quad cuts
+// straight through the lid and the uphill half of the sprite disappears into
+// it. A sprite of length L on a gradient g sinks by up to g*L/2.
+//
+// Measured over the shipped districts, of the surfaces a sprite can actually
+// stand on (ground type road or pavement, 16419 of them):
+//
+//     flat                                  72.06%
+//     7 degrees   (8 steps, g = 0.125)      21.88%
+//     26 degrees  (2 steps, g = 0.5)         5.92%
+//     45 degrees  (1 step,  g = 1.0)         0.14%
+//
+// A pedestrian quad is 0.47 blocks across (measured off the game's own shadow
+// slots), a car about 2. So 1/8 of a block clears 99.5% of the sloped surfaces
+// a pedestrian can reach and 78% of those a car can, which is every 7 degree
+// ramp - the common case by a wide margin. Doubling it to 1/4 buys nothing more
+// for cars, and it takes a full 1/2 block to cover them on 26 degree ramps,
+// which floats every sprite in the city half a block to fix 6% of surfaces.
+//
+// No single number does both jobs, which is why this is now the fallback rather
+// than the mechanism. It is used where there is no floor to measure - off the
+// map, over a hole, or with conforming switched off - and as the ceiling on the
+// extra clearance a footprint straddling a kerb is given.
+float g_spriteLift = kDefaultSpriteLift;
+
+// --- Conforming -----------------------------------------------------------
+//
+// The real answer, and what runs by default: sample the lid under the sprite's
+// four corners, fit a plane to it, and make that plane the sprite's transform.
+// The quad is then parallel to what it is standing on, so the whole slope term
+// above disappears and the clearance collapses to kConformClearance - a quarter
+// of a ground texel, enough to break coplanarity and nothing more.
+//
+// The part that matters for Remix: **the object-space quad does not change.**
+// Baking per-corner heights into the vertices is the obvious way to tilt a
+// sprite and it is the wrong one - local[] would become ground-dependent, so it
+// would change continuously as a car climbed a ramp, CanonicalShape's eight-shape
+// cache would fill and then dither, and the topological hash would churn exactly
+// the way the note above Place explains it must not. So the shape is still
+// measured from the flat corners the game gave, bit for bit, and every bit of
+// the ground adaptation lives in objectToWorld, which stays a pure rotation and
+// translation. That is the one form of this that Remix is happy with, and it
+// pays twice over: the normal handed to the path tracer becomes the ground
+// normal, so a car on a ramp is lit as one, and a replacement mesh placed by
+// this matrix inherits the bank for free.
+//
+// Two rules keep it out of trouble without having to recognise anything:
+//
+//   * A sprite is never moved *down*. Where the game's own level is above the
+//     floor the map reports, the game's wins - which leaves a jumping car, a
+//     helicopter and a bullet exactly where they were put, with no notion of
+//     what any of them are.
+//   * The tilt fades out over the same gap, so something leaving the ground
+//     rotates level again smoothly instead of snapping when it crosses a
+//     threshold.
+bool g_spriteConform = true;
+
+// How high the object sits above the road, as opposed to how far the quad is
+// held off it for the depth test. See kDefaultSpriteHeight: this is the one that
+// decides whether a car casts a shadow, and it was the thing the old fixed lift
+// was accidentally providing a little of while trying to do something else.
+float g_spriteHeight = kDefaultSpriteHeight;
+
+float Smoothstep(float edge0, float edge1, float x) {
+    if (x <= edge0) return 0.0f;
+    if (x >= edge1) return 1.0f;
+    const float t = (x - edge0) / (edge1 - edge0);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// Where the tilt starts to fade and where it is gone. The near edge is well
+// above any step a sprite stands on and well below a real jump; the far edge is
+// a block, at which point the game has plainly taken the object off the floor.
+constexpr float kTiltFadeNear = 0.25f;
+constexpr float kTiltFadeFar = 1.0f;
+
+// The tilt cap as the sine of the angle, which is what the normal is clamped
+// against: the horizontal part of a unit normal is exactly sin of the slope.
+const float kMaxTiltTan = std::tan(kMaxTiltDegrees * 3.14159265358979f / 180.0f);
+
+// How much a sprite keeps of a sideways tilt. See kDefaultSpriteRoll.
+float g_spriteRoll = kDefaultSpriteRoll;
+
+// How far a footprint may depart from the plane fitted through it before the
+// tilt stops being believed. Below the first figure the ground really is one
+// plane and the fit is worth following whole; past the second it is a step or a
+// block edge, where a confident tilt is worse than none.
+constexpr float kFitGood = 0.05f;
+constexpr float kFitPoor = 0.30f;
+
+// How much of the way to this frame's answer a sprite moves. The game is paced
+// at 30 fps, so a quarter converges in about a third of a second: fast enough to
+// follow a car up a ramp, slow enough that a footprint crossing a kerb eases
+// rather than steps.
+constexpr float kSmoothing = 0.25f;
+
+// Wider than anything can travel between two frames - a car at GTA2's top speed
+// covers about a third of this - and narrower than the gap to the next sprite.
+constexpr float kTrackRadius = 0.75f;
+
+// Anything outside this is stale data left in the shadow slots by an earlier
+// draw rather than a position the game just computed.
+constexpr float kWorldMargin = 8.0f;
+constexpr float kMinLevel = -4.0f;
+constexpr float kMaxLevel = 16.0f;
+
+struct Vec {
+    float x, y, z;
+};
+
+Vec Cross(const Vec& a, const Vec& b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+}  // namespace
+
+void SetSpriteLift(float blocks) {
+    // Negative would push sprites into the floor, which is the bug this exists
+    // to avoid; the ceiling is a whole block, past which a sprite is standing on
+    // the storey above.
+    g_spriteLift = blocks < 0.0f ? 0.0f : (blocks > 1.0f ? 1.0f : blocks);
+}
+
+float SpriteLift() { return g_spriteLift; }
+
+void SetSpriteConform(bool on) { g_spriteConform = on; }
+bool SpriteConform() { return g_spriteConform; }
+
+void SetSpriteRoll(float amount) {
+    g_spriteRoll = amount < 0.0f ? 0.0f : (amount > 1.0f ? 1.0f : amount);
+}
+
+float SpriteRoll() { return g_spriteRoll; }
+
+void SetSpriteHeight(float blocks) {
+    // Negative would bury the sprite, which is the bug all of this exists to
+    // avoid. The ceiling is a whole block: past that a sprite is standing at the
+    // height of the storey above the one the game put it on.
+    g_spriteHeight = blocks < 0.0f ? 0.0f : (blocks > 1.0f ? 1.0f : blocks);
+}
+
+float SpriteHeight() { return g_spriteHeight; }
+
+float g_spriteFeather = 0.0f;
+
+void SetSpriteFeather(float strength) {
+    g_spriteFeather = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
+}
+
+float SpriteFeather() { return g_spriteFeather; }
+
+// A hundredth of a block. Far below anything visible at GTA2's near-top-down
+// camera, and comfortably above the depth buffer's resolving power at the ten to
+// twenty units the camera actually sits at.
+float g_spriteStackStep = 0.01f;
+
+void SetSpriteStackStep(float blocks) {
+    g_spriteStackStep = blocks < 0.0f ? 0.0f : (blocks > 0.25f ? 0.25f : blocks);
+}
+
+float SpriteStackStep() { return g_spriteStackStep; }
+
+int g_effectBatches = 0;
+int EffectBatchesDrawn() { return g_effectBatches; }
+
+bool g_ownCarLamps = kDefaultOwnCarLamps;
+
+// GTA2Ceiling sprite body: thickness in blocks. [sprites] depth=0 in
+// gta2ceiling.ini restores the original flat sprites.
+constexpr float kVehicleDepth = 0.28f;
+constexpr float kPersonDepth = 0.40f;  // people: taller than wide
+int g_spriteDepthLayers = 6;
+bool g_contactShadows = true;
+bool ReadSpriteDepthSetting() {
+    char path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char* slash = std::strrchr(path, '\\');
+    if (!slash) return true;
+    std::strcpy(slash + 1, "gta2ceiling.ini");
+    return GetPrivateProfileIntA("sprites", "depth", 1, path) != 0;
+}
+bool SpriteDepthOn() {
+    static const bool on = ReadSpriteDepthSetting();
+    return on;
+}
+void ReleaseLampTextures();
+// Per lamp delta, one entry per car sprite.
+std::map<int, std::vector<LampArt>> g_lampArt;
+void SetOwnCarLamps(bool on) { g_ownCarLamps = on; }
+void SetSpriteContactShadows(bool on) { g_contactShadows = on; }
+void SetSpriteDepthLayers(int layers) { g_spriteDepthLayers = layers < 2 ? 2 : (layers > 16 ? 16 : layers); }
+bool OwnCarLamps() { return g_ownCarLamps; }
+
+std::vector<uint32_t> LampTexels(const LampArt& art, bool mirrored) {
+    std::vector<uint32_t> texels(art.argb.size(), 0);
+    uint32_t sum[3] = {}, count = 0;
+    for (uint32_t c : art.argb) {
+        if (!(c >> 24)) continue;
+        sum[0] += (c >> 16) & 0xFF;
+        sum[1] += (c >> 8) & 0xFF;
+        sum[2] += c & 0xFF;
+        ++count;
+    }
+    const uint32_t fill =
+        count ? ((sum[0] / count) << 16) | ((sum[1] / count) << 8) | (sum[2] / count) : 0;
+    for (int y = 0; y < art.height; ++y) {
+        for (int x = 0; x < art.width; ++x) {
+            const int from = mirrored ? art.width - 1 - x : x;
+            const uint32_t c = art.argb[static_cast<size_t>(y) * art.width + from];
+            texels[static_cast<size_t>(y) * art.width + x] = (c >> 24) ? c : fill;
+        }
+    }
+    return texels;
+}
+
+void SetCarLampArt(int delta, std::vector<LampArt> bySprite) {
+    // Textures point at the art they were made from.
+    ReleaseLampTextures();
+    g_lampArt[delta] = std::move(bySprite);
+}
+
+// Textures for the lamps, made on first use, keyed by the art and which side.
+std::map<std::pair<const LampArt*, bool>, IDirect3DTexture9*> g_lampTextures;
+IDirect3DDevice9* g_lampDevice = nullptr;
+
+void ReleaseLampTextures() {
+    for (auto& entry : g_lampTextures) {
+        if (entry.second) entry.second->Release();
+    }
+    g_lampTextures.clear();
+}
+
+IDirect3DTexture9* LampTexture(IDirect3DDevice9* device, const LampArt* art, bool mirrored) {
+    if (!art || !art->Valid()) return nullptr;
+    if (g_lampDevice != device) {
+        ReleaseLampTextures();
+        g_lampDevice = device;
+    }
+    auto found = g_lampTextures.find({art, mirrored});
+    if (found != g_lampTextures.end()) return found->second;
+    IDirect3DTexture9* texture = nullptr;
+    if (FAILED(device->CreateTexture(art->width, art->height, 1, 0, D3DFMT_A8R8G8B8,
+                                     D3DPOOL_MANAGED, &texture, nullptr))) {
+        texture = nullptr;
+    } else {
+        const std::vector<uint32_t> texels = LampTexels(*art, mirrored);
+        D3DLOCKED_RECT locked;
+        if (SUCCEEDED(texture->LockRect(0, &locked, nullptr, 0))) {
+            for (int y = 0; y < art->height; ++y) {
+                memcpy(static_cast<uint8_t*>(locked.pBits) + y * locked.Pitch,
+                       &texels[static_cast<size_t>(y) * art->width],
+                       static_cast<size_t>(art->width) * 4);
+            }
+            texture->UnlockRect(0);
+        }
+    }
+    g_lampTextures[{art, mirrored}] = texture;
+    return texture;
+}
+
+// The last complete frame's conform counts. The menu has no handle on the
+// LiveGeometry instance - the same reason EffectBatchesDrawn is a free function.
+LiveGeometry::Conform g_lastConform;
+const LiveGeometry::Conform& SpriteConformCounts() { return g_lastConform; }
+
+void LiveGeometry::BeginFrame() {
+    ClearDrawCache();
+    sprites_.clear();
+    lastObject_ = nullptr;
+    stacks_.clear();
+    spriteQuads_ = 0;
+    effectQuads_ = 0;
+    g_lastConform = conform_;
+    conform_ = Conform{};
+    // This frame's placements become next frame's history.
+    tracks_.swap(tracksNext_);
+    tracksNext_.clear();
+}
+
+const LiveGeometry::Track* LiveGeometry::FindTrack(const void* texture, float x, float z) const {
+    const Track* best = nullptr;
+    float bestDistance = kTrackRadius * kTrackRadius;
+    for (const Track& track : tracks_) {
+        // The texture has to match: two sprites can share a spot - a car and its
+        // own headlight quad - and easing one toward the other's answer is the
+        // pop this is meant to remove, not a smaller one.
+        if (track.texture != texture) continue;
+        const float dx = track.x - x, dz = track.z - z;
+        const float distance = dx * dx + dz * dz;
+        if (distance <= bestDistance) {
+            bestDistance = distance;
+            best = &track;
+        }
+    }
+    return best;
+}
+
+// Which layer of a stack this sprite belongs to.
+//
+// Two quads count as stacked when their centres are within about a third of a
+// tile, which is well inside a car and well outside the gap to the next one. The
+// search is linear over the sprites already taken this frame, which is tens of
+// entries - a car's worth of parts, a few pedestrians - so it costs nothing
+// worth indexing away.
+//
+// Only a sprite that is not much smaller counts as something to stack on. The
+// stack is for a car's lights, logo and roof light, which are drawn after the
+// body and are its own size or smaller, so they still climb onto it. It is not
+// for the burst of exhaust smoke a car puffs out under itself as it pulls away:
+// six small particles drawn *before* the body counted as a pile six deep and
+// lifted the car by six steps, three times its ride height, which in Remix
+// tears its shadow off - and then it eased back down as the smoke died. That
+// was the hop when a car starts from standstill, and whatever small thing sat
+// under a parked car held it up the same way.
+int LiveGeometry::StackLayerFor(float cx, float cz, float area) {
+    const float kSameSpot = 0.33f * 0.33f;
+    // A quarter of the area: a car's roof light still counts against a car,
+    // a smoke puff or a pedestrian does not.
+    const float kComparable = 0.25f;
+    int layer = 0;
+    for (const Stack& s : stacks_) {
+        const float dx = s.x - cx, dz = s.z - cz;
+        if (dx * dx + dz * dz > kSameSpot || s.layer < layer) continue;
+        if (s.area < area * kComparable) continue;
+        layer = s.layer + 1;
+    }
+    // A car with a light and a logo is three deep; anything claiming more than
+    // this is sprites that happen to share a spot rather than a real stack, and
+    // letting it climb would float them.
+    const int kMaxLayers = 6;
+    if (layer > kMaxLayers) layer = kMaxLayers;
+    stacks_.push_back({cx, cz, area, layer});
+    return layer;
+}
+
+// The game's world frame is x east, y south, level up. Ours is x east, y up,
+// z north, so the row is mirrored exactly the way the static mesh builder
+// mirrors it - sharing the sign would put sprites on the wrong side of town.
+bool LiveGeometry::ReadCorners(const float* vertices, int corners, const void* texture,
+                              uintptr_t shadowBase, Vertex* out) const {
+    const TextureRecord* record = static_cast<const TextureRecord*>(texture);
+    const float invU = record && record->width ? 1.0f / record->width : 1.0f / 64.0f;
+    const float invV = record && record->height ? 1.0f / record->height : 1.0f / 64.0f;
+
+    for (int i = 0; i < corners; ++i) {
+        const float* world = reinterpret_cast<const float*>(
+            shadowBase + static_cast<uintptr_t>(i + game::kWorldShadowSlots) * game::kVertexStride);
+        if (!std::isfinite(world[0]) || !std::isfinite(world[1]) || !std::isfinite(world[2])) {
+            ++drops_.notFinite;
+            return false;
+        }
+        if (world[0] < -kWorldMargin || world[0] > gta2::kMapWidth + kWorldMargin ||
+            world[1] < -kWorldMargin || world[1] > gta2::kMapHeight + kWorldMargin ||
+            world[2] < kMinLevel || world[2] > kMaxLevel) {
+            ++drops_.outOfWorld;
+            return false;
+        }
+        out[i].x = world[0];
+        out[i].y = world[2];
+        out[i].z = static_cast<float>(gta2::kMapHeight) - world[1];
+        out[i].u = vertices[i * kGameVertexFloats + kUvU] * invU;
+        out[i].v = vertices[i * kGameVertexFloats + kUvV] * invV;
+    }
+
+    // A real normal rather than a fixed "up": GTA2 sprites lie flat but the odd
+    // block faces are vertical, and Remix uses the normal.
+    const Vec e1{out[1].x - out[0].x, out[1].y - out[0].y, out[1].z - out[0].z};
+    const Vec e2{out[2].x - out[0].x, out[2].y - out[0].y, out[2].z - out[0].z};
+    Vec n = Cross(e1, e2);
+    const float length = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+    if (length < 1e-9f) {
+        ++drops_.degenerate;  // no area, nothing to draw
+        return false;
+    }
+    n = {n.x / length, n.y / length, n.z / length};
+    for (int i = 0; i < corners; ++i) {
+        out[i].nx = n.x;
+        out[i].ny = n.y;
+        out[i].nz = n.z;
+    }
+    return true;
+}
+
+namespace {
+
+// The quad a sprite has always had, rather than the one this frame worked out.
+//
+// Quantising the measured quad is not quite enough. The corners arrive from the
+// game's fixed point through a normalise, so the last mantissa bits move about
+// even for a parked car, and a value that happens to sit on a rounding boundary
+// dithers between two quantised results - which is precisely the vertex-hash
+// churn this whole exercise exists to remove.
+//
+// So the first quad seen for a sprite is quantised and kept, and every later one
+// that is the same shape to within a coarse tolerance is answered with the
+// stored copy, bit for bit. A sprite genuinely drawn at a second size gets a
+// second entry; the cap is there so that something continuously scaled cannot
+// grow this without bound.
+struct Shape {
+    LiveGeometry::Vertex local[4];
+};
+std::map<const void*, std::vector<Shape>> g_shapes;
+constexpr size_t kMaxShapesPerTexture = 8;
+
+void CanonicalShape(const void* texture, const LiveGeometry::Vertex* measured, int corners,
+                    LiveGeometry::Vertex* out) {
+    // A 256th of a tile, about 8 mm at GTA2's scale: far above the float noise
+    // and far below any real difference in sprite size.
+    const float kTolerance = 1.0f / 256.0f;
+
+    std::vector<Shape>& known = g_shapes[texture];
+    for (const Shape& shape : known) {
+        bool same = true;
+        for (int i = 0; i < corners && same; ++i) {
+            same = std::fabs(shape.local[i].x - measured[i].x) < kTolerance &&
+                   std::fabs(shape.local[i].y - measured[i].y) < kTolerance &&
+                   std::fabs(shape.local[i].z - measured[i].z) < kTolerance &&
+                   std::fabs(shape.local[i].u - measured[i].u) < kTolerance &&
+                   std::fabs(shape.local[i].v - measured[i].v) < kTolerance;
+        }
+        if (same) {
+            memcpy(out, shape.local, sizeof(Shape::local[0]) * corners);
+            return;
+        }
+    }
+
+    Shape shape{};
+    auto quantise = [](float value) { return std::floor(value * 4096.0f + 0.5f) / 4096.0f; };
+    for (int i = 0; i < corners; ++i) {
+        shape.local[i] = measured[i];
+        shape.local[i].x = quantise(measured[i].x);
+        shape.local[i].y = quantise(measured[i].y);
+        shape.local[i].z = quantise(measured[i].z);
+    }
+    memcpy(out, shape.local, sizeof(Shape::local[0]) * corners);
+    if (known.size() < kMaxShapesPerTexture) known.push_back(shape);
+}
+
+}  // namespace
+
+void SpriteShapeCounts(int* shapes, int* textures) {
+    int total = 0;
+    for (const auto& entry : g_shapes) total += static_cast<int>(entry.second.size());
+    if (shapes) *shapes = total;
+    if (textures) *textures = static_cast<int>(g_shapes.size());
+}
+
+// Take the quad apart into a shape and a placement.
+//
+// The shape is the quad measured in its own frame: origin at its centre, one
+// axis along its first edge, one along its normal. A GTA2 sprite is rigid, so
+// for a given sprite that measurement is the same numbers wherever it stands and
+// however it is turned - which is exactly the property Remix needs to recognise
+// it again next frame. The placement is that frame's position in the world, and
+// it is what Remix differentiates to get the motion vector.
+//
+// The measured shape goes through CanonicalShape above, which is what makes it
+// bit-identical rather than merely close.
+bool LiveGeometry::Place(const Vertex* world, int corners, const Vec3& centre,
+                         const Vec3* groundUp, Sprite* out) const {
+    // The corners' own centroid, which is what the shape is measured about. It is
+    // deliberately not `centre`: the shape has to come out the same numbers
+    // wherever the sprite stands, so the placement can never be allowed to leak
+    // into it.
+    const Vec measured{
+        (world[0].x + world[1].x + world[2].x + world[3].x) * 0.25f,
+        (world[0].y + world[1].y + world[2].y + world[3].y) * 0.25f,
+        (world[0].z + world[1].z + world[2].z + world[3].z) * 0.25f,
+    };
+
+    // The quad's own frame: right along its first edge, up along its normal,
+    // forward completing the set. Orthonormal by construction, so the matrix is a
+    // rotation and a translation and nothing else - normals survive it unchanged
+    // and Remix's inverse of it is exact.
+    const Vec edge{world[1].x - world[0].x, world[1].y - world[0].y, world[1].z - world[0].z};
+    const Vec up{world[0].nx, world[0].ny, world[0].nz};   // ReadCorners already normalised this
+
+    const float edgeLength = std::sqrt(edge.x * edge.x + edge.y * edge.y + edge.z * edge.z);
+    if (edgeLength < 1e-6f) {
+        ++drops_.degenerate;
+        return false;
+    }
+    const Vec right{edge.x / edgeLength, edge.y / edgeLength, edge.z / edgeLength};
+    // Cross(right, up) rather than Cross(up, right): the three axes have to come
+    // out right handed or the matrix is a reflection, which flips the winding and
+    // has Remix guessing at which way the face points.
+    const Vec forward = Cross(right, up);
+
+    Vertex local[4];
+    for (int i = 0; i < corners; ++i) {
+        const Vec offset{world[i].x - measured.x, world[i].y - measured.y, world[i].z - measured.z};
+        local[i].x = offset.x * right.x + offset.y * right.y + offset.z * right.z;
+        local[i].y = offset.x * up.x + offset.y * up.y + offset.z * up.z;
+        local[i].z = offset.x * forward.x + offset.y * forward.y + offset.z * forward.z;
+        // The normal is the frame's own up, so in object space it is exactly that
+        // for every sprite - one more thing that cannot drift.
+        local[i].nx = 0.0f;
+        local[i].ny = 1.0f;
+        local[i].nz = 0.0f;
+        local[i].u = world[i].u;
+        local[i].v = world[i].v;
+    }
+    CanonicalShape(out->texture, local, corners, out->local);
+    out->corners = corners;
+
+    // Now the same frame rotated onto the ground. The shape above was measured
+    // against the quad's own up; rotating both axes together is a rigid motion of
+    // that frame, so local[] still describes the same sprite - which is precisely
+    // why the tilt goes here and not into the vertices.
+    Vec rightOut = right;
+    Vec upOut = up;
+    Vec forwardOut = forward;
+    if (groundUp) {
+        // The quad's normal can point either way depending on how the game wound
+        // it, and the ground normal only ever points up. Matching the sign keeps
+        // the frame's handedness, which local[] was built against; taking it
+        // straight would mirror every sprite whose quad happened to face down.
+        const float sign = up.y >= 0.0f ? 1.0f : -1.0f;
+        const Vec ground{groundUp->x * sign, groundUp->y * sign, groundUp->z * sign};
+        // The heading, re-squared against the new up. A GTA2 sprite's first edge
+        // is horizontal, so this is a small rotation about it and nothing else.
+        const float along = right.x * ground.x + right.y * ground.y + right.z * ground.z;
+        const Vec projected{right.x - ground.x * along, right.y - ground.y * along,
+                            right.z - ground.z * along};
+        const float length = std::sqrt(projected.x * projected.x + projected.y * projected.y +
+                                       projected.z * projected.z);
+        // Only a quad standing on its edge could line up with the ground normal,
+        // and there is no heading to recover from one. Those keep their own frame.
+        if (length > 1e-4f) {
+            rightOut = {projected.x / length, projected.y / length, projected.z / length};
+            upOut = ground;
+            forwardOut = Cross(rightOut, upOut);
+        }
+    }
+
+    // D3D9 multiplies row vectors on the left, so the basis goes in the rows and
+    // the translation in the last one.
+    gta2::Mat4& m = out->objectToWorld;
+    m = gta2::Mat4{};
+    m.m[0][0] = rightOut.x;   m.m[0][1] = rightOut.y;   m.m[0][2] = rightOut.z;
+    m.m[1][0] = upOut.x;      m.m[1][1] = upOut.y;      m.m[1][2] = upOut.z;
+    m.m[2][0] = forwardOut.x; m.m[2][1] = forwardOut.y; m.m[2][2] = forwardOut.z;
+    m.m[3][0] = centre.x;     m.m[3][1] = centre.y;     m.m[3][2] = centre.z;
+    m.m[3][3] = 1.0f;
+    return true;
+}
+
+void LiveGeometry::AddSprite(unsigned flags, const void* texture, const float* vertices,
+                             int corners, bool lamps) {
+    if (!texture || !vertices) return;
+    // With this flag only vertex 0 is filled in, so the other three shadow slots
+    // still hold whatever the previous draw left there.
+    if (flags & quad_flags::kExpandFromTexture) {
+        ++drops_.expandFlag;
+        return;
+    }
+
+    // The shadow slots only describe the game's *own* vertex array. FUN_004be060
+    // also draws an object's drop shadow from a nudged stack copy of those
+    // vertices, and pairing that copy with the unmoved world positions stretched
+    // the sprite into a second, wrong polygon - the extra "sprouting" panels on
+    // trees. Only the real array can be trusted here.
+    if (reinterpret_cast<uintptr_t>(vertices) != game::kSpriteVertexArray) {
+        ++drops_.notTheSpriteArray;
+        return;
+    }
+
+    // A pedestrian blown apart: the limbs are on the ground, so the body is not.
+    // See gibs.cpp.
+    if (GibsHideCurrentSprite()) return;
+
+    Vertex out[4];
+    if (!ReadCorners(vertices, corners, texture, game::kSpriteVertexArray, out)) return;
+
+    // A car's lamps, laid on its body.
+    //
+    // The game draws them as a second quad with exactly the body's corners - the
+    // same vertex array, only the texture coordinates set again (FUN_004B9BC0) -
+    // and placed on its own it drifted from the body: a ground fit, a smoothing
+    // history and a stack layer of its own, which on a slope or a kerb left the
+    // lamps inside the car. So it takes the body's placement outright, shape and
+    // transform, and sits a hair above it along the body's own normal, where it
+    // cannot end up anywhere but on top.
+    if (lamps) {
+        const void* object = GameObjectBeingDrawn();
+        if (g_ownCarLamps && object && object == lastObject_ && lastSprite_ < sprites_.size()) {
+            // Ours instead of the game's. See OwnCarLamps.
+            AddCarLamps(sprites_[lastSprite_]);
+            return;
+        }
+        if (object && object == lastObject_ && lastSprite_ < sprites_.size() && corners == 4) {
+            Sprite placed = sprites_[lastSprite_];
+            placed.texture = texture;
+            // The quad's own up can face the ground, depending on how the game
+            // wound it; "above" is whichever way its frame's up points in the
+            // world.
+            const float above = placed.objectToWorld.m[1][1] >= 0.0f ? 1.0f : -1.0f;
+            for (int i = 0; i < 4; ++i) {
+                placed.local[i].u = out[i].u;
+                placed.local[i].v = out[i].v;
+                placed.local[i].y += kConformClearance * above;
+            }
+            sprites_.push_back(placed);
+            ++spriteQuads_;
+            ++drops_.accepted;
+            return;
+        }
+        // No body this frame to lay them on; placed like any other sprite.
+    }
+
+    // Limbs are drawn larger than their artwork. See gibs.cpp.
+    const float scale = corners == 4 ? GibsCurrentScale() : 1.0f;
+    if (scale != 1.0f) {
+        const float mx = (out[0].x + out[1].x + out[2].x + out[3].x) * 0.25f;
+        const float mz = (out[0].z + out[1].z + out[2].z + out[3].z) * 0.25f;
+        for (int i = 0; i < 4; ++i) {
+            out[i].x = mx + (out[i].x - mx) * scale;
+            out[i].z = mz + (out[i].z - mz) * scale;
+        }
+    }
+
+    // Only quads come through here - gbh_DrawQuad and gbh_DrawQuadClipped are the
+    // only callers - and Place measures the frame from four corners.
+    if (corners != 4) {
+        ++drops_.degenerate;
+        return;
+    }
+
+    // Where the game put the sprite. All four corners carry the single level of
+    // the object, so this is that level and the footprint it covers.
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+    for (int i = 0; i < corners; ++i) {
+        cx += out[i].x;
+        cy += out[i].y;
+        cz += out[i].z;
+    }
+    const float inv = 1.0f / static_cast<float>(corners);
+    cx *= inv;
+    cy *= inv;
+    cz *= inv;
+
+    // The stack layer is decided from where the sprite sits, before it is
+    // lifted, so a car's lights and logo land on the body rather than on each
+    // other's raised copies.
+    // A quad's corners go round its edge in order, so two adjacent sides give
+    // its footprint.
+    const float sideAx = out[1].x - out[0].x, sideAz = out[1].z - out[0].z;
+    const float sideBx = out[2].x - out[1].x, sideBz = out[2].z - out[1].z;
+    const float area = std::sqrt(sideAx * sideAx + sideAz * sideAz) *
+                       std::sqrt(sideBx * sideBx + sideBz * sideBz);
+    // Skid marks, blood trails and blood pools lie on the road rather than
+    // standing on it: no ride height, and none of the clearance a car is given.
+    // They still follow the ground's tilt, keep the quarter-texel gap that
+    // breaks coplanarity with the road, and stack against each other - but by
+    // a sliver per layer, because a trail is dozens of overlapping strips and a
+    // car's worth of stack step each piled them into the air.
+    const bool decal = IsGroundDecal(texture);
+    // A limb or a body lies on the road rather than standing on it like a
+    // pedestrian, but it is not flat paint either: a third of a sprite's ride
+    // height.
+    const bool lying = scale != 1.0f || GameObjectIsCorpse();
+    // A limb that has landed goes on the floor, whatever height the game left it
+    // at. See GibsCurrentIsResting.
+    const bool resting = scale != 1.0f && GibsCurrentIsResting();
+    const float stackStep = decal ? kConformClearance * 0.25f : g_spriteStackStep;
+    const float stacked = stackStep > 0.0f ? StackLayerFor(cx, cz, area) * stackStep : 0.0f;
+
+    // Stand it on the floor the map says is under it. See the note on
+    // g_spriteConform: the quad itself is not touched, only the frame it is
+    // placed in.
+    Vec3 groundUp{0.0f, 1.0f, 0.0f};
+    bool tilted = false;
+    float baseY = cy;
+    float clearance = g_spriteLift;
+    // The real floor under the corners and the middle, kept for the guard after
+    // smoothing. A sample with no floor under it is left out.
+    float guardX[5], guardZ[5], guardFloor[5];
+    int guardSamples = 0;
+
+    // A quad standing on its edge has no floor under it in any useful sense.
+    // Nothing on this path should be one, but the guard is a line and the
+    // alternative is a sprite laid flat on the road.
+    const bool flatQuad = std::fabs(out[0].ny) > 0.5f;
+    if (g_spriteConform && ground_ && ground_->Ready() && flatQuad) {
+        // The corners plus the middle. A car parked across the ridge where a ramp
+        // meets the flat has all four corners low and the crest under its belly,
+        // which four samples cannot see at all.
+        const float xs[5] = {out[0].x, out[1].x, out[2].x, out[3].x, cx};
+        const float zs[5] = {out[0].z, out[1].z, out[2].z, out[3].z, cz};
+        const gta2dx9::GroundPlane plane =
+            ground_->Fit(xs, zs, corners + 1, cy + GroundSampler::kCeilingHeadroom, cx, cz);
+        if (plane.valid) {
+            for (int i = 0; i < corners + 1; ++i) {
+                float floorHere = 0.0f;
+                if (!ground_->SurfaceAt(xs[i], zs[i], cy + GroundSampler::kCeilingHeadroom,
+                                        &floorHere)) {
+                    continue;
+                }
+                guardX[guardSamples] = xs[i];
+                guardZ[guardSamples] = zs[i];
+                guardFloor[guardSamples] = floorHere;
+                ++guardSamples;
+            }
+        }
+        if (!plane.valid) {
+            ++conform_.noGround;
+        } else {
+            const float gap = resting ? 0.0f : cy - plane.y;
+            if (gap > conform_.maxGap) conform_.maxGap = gap;
+            if (plane.residual > conform_.maxResidual) conform_.maxResidual = plane.residual;
+
+            // Never downward: above its floor, the game's own height wins -
+            // except for a limb at rest, whose gap is taken as none.
+            baseY = gap > 0.0f ? cy : plane.y;
+
+            // The gradient the ground actually has. Working in gradient rather
+            // than in the normal keeps every adjustment below a plain scaling of
+            // two numbers, and the normal falls out at the end.
+            const float rawGx = -plane.nx / plane.ny;
+            const float rawGz = -plane.nz / plane.ny;
+
+            // Two reasons to use less of it than all. A footprint that is not one
+            // plane has a fit that means little, so a large residual damps the
+            // tilt instead of steering it - that is a corner over a kerb, which
+            // is exactly the case that used to lift one corner of a car. And a
+            // sprite off the ground levels out over the same gap the lift fades
+            // across.
+            const float trust = 1.0f - Smoothstep(kFitGood, kFitPoor, plane.residual);
+            const float fade = 1.0f - Smoothstep(kTiltFadeNear, kTiltFadeFar, gap);
+            float gx = rawGx * trust * fade;
+            float gz = rawGz * trust * fade;
+
+            // Pitch is kept, roll is damped. The long side of the quad is the
+            // sprite's own direction of travel - two blocks against one for a
+            // car - so a gradient along it tips the nose, which is what driving
+            // up a ramp looks like, and a gradient across it lifts one side,
+            // which a car on wheels does not do. See kDefaultSpriteRoll.
+            float axisX = out[1].x - out[0].x, axisZ = out[1].z - out[0].z;
+            const float sideA = std::sqrt(axisX * axisX + axisZ * axisZ);
+            const float otherX = out[2].x - out[1].x, otherZ = out[2].z - out[1].z;
+            const float sideB = std::sqrt(otherX * otherX + otherZ * otherZ);
+            if (sideB > sideA) {
+                axisX = otherX;
+                axisZ = otherZ;
+            }
+            const float axisLength = (std::max)(sideA, sideB);
+            if (axisLength > 1e-6f && g_spriteRoll < 1.0f) {
+                axisX /= axisLength;
+                axisZ /= axisLength;
+                const float along = gx * axisX + gz * axisZ;   // the pitch part
+                const float acrossX = gx - axisX * along;      // the roll part
+                const float acrossZ = gz - axisZ * along;
+                gx = axisX * along + acrossX * g_spriteRoll;
+                gz = axisZ * along + acrossZ * g_spriteRoll;
+            }
+
+            const float slope = std::sqrt(gx * gx + gz * gz);
+            if (slope > kMaxTiltTan) {
+                const float scale = kMaxTiltTan / slope;
+                gx *= scale;
+                gz *= scale;
+                ++conform_.capped;
+            }
+            if (slope > 1e-6f) {
+                const float inv = 1.0f / std::sqrt(gx * gx + 1.0f + gz * gz);
+                groundUp = {-gx * inv, inv, -gz * inv};
+                tilted = true;
+            }
+
+            // Clearance is measured against the tilt the sprite actually ended up
+            // with, not the one the ground has - so everything given away above,
+            // to the roll damping, the trust and the cap, comes back here as
+            // height instead of as a sprite cutting into the road.
+            float needed = 0.0f;
+            if (gap > kConformClearance) {
+                // The game has it above the plane fitted under it, and that
+                // plane is then not the floor. The case is a car on the upper
+                // of two floors with part of its footprint over the lower one -
+                // a kerb, a block edge: the fit runs a slope between the two,
+                // and its residual measures the step, not anything under the
+                // car. Adding that back as clearance floated the car by up to
+                // half a block, and eased it up over a few frames as it started
+                // to move onto an edge - the hop - or held it up while it stood
+                // there and dropped it as it drove off.
+                //
+                // The samples themselves say what is actually under it: clear
+                // whatever real floor rises above the quad, and nothing else.
+                // The lower floor it overhangs contributes nothing, and the one
+                // it stands on only what its own tilt dips into.
+                const float ceiling = cy + GroundSampler::kCeilingHeadroom;
+                for (int i = 0; i < corners + 1; ++i) {
+                    float floorHere = 0.0f;
+                    if (!ground_->SurfaceAt(xs[i], zs[i], ceiling, &floorHere)) continue;
+                    const float quadHere = baseY + gx * (xs[i] - cx) + gz * (zs[i] - cz);
+                    if (floorHere - quadHere > needed) needed = floorHere - quadHere;
+                }
+            } else {
+                // On the fitted floor. The residual is how far the highest sample
+                // pokes above the plane, so the quad has to clear that plus
+                // whatever the plane itself rises above the quad at a corner -
+                // which is where the gap between two flat things is widest.
+                float worst = 0.0f;
+                for (int i = 0; i < corners; ++i) {
+                    const float dx = out[i].x - cx;
+                    const float dz = out[i].z - cz;
+                    const float floorHere = plane.y + rawGx * dx + rawGz * dz;
+                    const float quadHere = baseY + gx * dx + gz * dz;
+                    if (floorHere - quadHere > worst) worst = floorHere - quadHere;
+                }
+                needed = worst + plane.residual;
+            }
+            const float owed = (needed - g_spriteHeight * groundUp.y) / groundUp.y;
+            const float extra = owed > 0.0f ? (std::min)(owed, kMaxExtraClearance) : 0.0f;
+            clearance = kConformClearance + extra;
+            if (needed > kConformClearance) ++conform_.straddled;
+            if (fade < 1.0f) {
+                ++conform_.airborne;
+            } else {
+                ++conform_.grounded;
+            }
+        }
+    }
+
+    // Ease toward this frame's answer rather than snapping to it. Only the lift
+    // and the tilt are smoothed: baseY follows the ground directly, because a car
+    // driving up a ramp *should* rise with it and lagging that would be the
+    // strange movement rather than the fix for it. See the Track note.
+    float offset = decal  ? kConformClearance + stacked
+                 : lying  ? kConformClearance + g_spriteHeight * 0.33f + stacked
+                          : g_spriteHeight + clearance + stacked;
+    if (const Track* previous = FindTrack(texture, cx, cz)) {
+        offset = previous->offset + (offset - previous->offset) * kSmoothing;
+        Vec3 eased{previous->nx + (groundUp.x - previous->nx) * kSmoothing,
+                   previous->ny + (groundUp.y - previous->ny) * kSmoothing,
+                   previous->nz + (groundUp.z - previous->nz) * kSmoothing};
+        const float length =
+            std::sqrt(eased.x * eased.x + eased.y * eased.y + eased.z * eased.z);
+        if (length > 1e-6f) {
+            groundUp = {eased.x / length, eased.y / length, eased.z / length};
+            tilted = std::fabs(groundUp.x) > 1e-5f || std::fabs(groundUp.z) > 1e-5f;
+        }
+    }
+
+    // The floor guard, after the smoothing and against what is actually drawn.
+    //
+    // Clearance above is worked out for the tilt and height the sprite is
+    // heading for, but both are then eased there over a few frames. Driving onto
+    // a ramp that lag is the clip: the target tips the nose up and adds the
+    // clearance the kink needs, the eased sprite is still nearly level and
+    // nearly as low, and for a few frames the front corner is inside the slope.
+    // So measure the real floor at the corners and the middle against the tilt
+    // this frame really has, and if any of them would be under it, raise the
+    // sprite to just clear it - now, not eased. Only ever up, and only as far as
+    // the floor demands, so nothing already clear moves: easing still decides
+    // everything else, and lowering stays smooth.
+    if (guardSamples > 0 && groundUp.y > 1e-3f) {
+        const float gx = -groundUp.x / groundUp.y;
+        const float gz = -groundUp.z / groundUp.y;
+        float least = offset;
+        for (int i = 0; i < guardSamples; ++i) {
+            const float under = baseY + gx * (guardX[i] - cx) + gz * (guardZ[i] - cz);
+            const float need = (guardFloor[i] + kConformClearance - under) / groundUp.y;
+            if (need > least) least = need;
+        }
+        offset = least;
+    }
+    tracksNext_.push_back({texture, cx, cz, offset, groundUp.x, groundUp.y, groundUp.z});
+
+    // Along the ground normal rather than straight up: on a ramp those are not
+    // the same direction, and clearance measured the wrong way is not clearance.
+    // The ride height goes the same way, so a car on a ramp rides above the ramp
+    // rather than leaning out of it.
+    const Vec3 centre{cx + groundUp.x * offset, baseY + groundUp.y * offset,
+                      cz + groundUp.z * offset};
+
+    Sprite placed;
+    placed.texture = texture;
+    if (!Place(out, corners, centre, tilted ? &groundUp : nullptr, &placed)) return;
+
+    // Which game object this is, written into the quad itself.
+    //
+    // Every sprite of one texture and size used to be the very same geometry, so
+    // to Remix two pedestrians on the same animation frame, or two phone boxes,
+    // were one mesh drawn twice. It tells those instances apart from frame to
+    // frame by position alone (InstanceManager::findSimilarInstance: an exact
+    // transform, else the nearest unclaimed instance of that mesh), and a
+    // transform that moves by so much as a stack step loses the exact match. The
+    // nearest one is then sometimes the other object, which hands this sprite
+    // that object's history - its previous position and its motion - and the
+    // denoiser and DLSS draw it where the other one was. That is the copy in the
+    // wrong place.
+    //
+    // The game's sprite object is the identity: the same object every frame for
+    // as long as the thing exists, and no two live things share one. A few low
+    // bits of it become an offset along the quad's normal of at most 6e-5 tiles -
+    // a quarter of a millimetre - which no one can see and which makes each
+    // object's quad a mesh of its own, so there is nothing left to confuse.
+    if (const void* object = GameObjectBeingDrawn()) {
+        const uint32_t bits = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(object) >> 2);
+        const float nudge = static_cast<float>(bits & 0xFFFF) * (1.0f / 1073741824.0f);
+        for (int i = 0; i < placed.corners; ++i) placed.local[i].y += nudge;
+    }
+    placed.plain = GameObjectIsPowerUp();
+    placed.flat = decal;
+    lastObject_ = GameObjectBeingDrawn();
+    lastSprite_ = sprites_.size();
+    sprites_.push_back(placed);
+    ++spriteQuads_;
+    ++drops_.accepted;
+
+    // The game's own corner positions, straight out of the shadow slots and
+    // before our axis swap, so the question "does GTA2 lift a sprite off the
+    // floor it stands on?" can be answered from its numbers rather than ours.
+    if (spriteLogs_ < 8) {
+        ++spriteLogs_;
+        char line[320];
+        int used = snprintf(line, sizeof(line), "sprite corners (game frame x,y,level):");
+        for (int i = 0; i < corners && used > 0 && used < static_cast<int>(sizeof(line)) - 40; ++i) {
+            const float* world = reinterpret_cast<const float*>(
+                game::kSpriteVertexArray +
+                static_cast<uintptr_t>(i + game::kWorldShadowSlots) * game::kVertexStride);
+            used += snprintf(line + used, sizeof(line) - used, "  (%.4f %.4f %.4f)", world[0],
+                             world[1], world[2]);
+        }
+        Log("%s", line);
+    }
+}
+
+// Each lit lamp of the car just drawn, as a quad of its own over the lamp's
+// pixels on the body. The body's corners carry the sprite's texture coordinates,
+// so a point of the sprite at (u, v) is the bilinear blend of the corners by
+// where u and v fall between the corners' own - which also takes care of however
+// the game turned or mirrored the quad.
+void LiveGeometry::AddCarLamps(const Sprite& body) {
+    const uint8_t* object = static_cast<const uint8_t*>(GameObjectBeingDrawn());
+    if (!object || body.corners != 4) return;
+    if (*reinterpret_cast<const int32_t*>(object + game::kSpriteObjectBase) != game::kSpriteBaseCar) {
+        return;
+    }
+    const uint8_t* car = *reinterpret_cast<const uint8_t* const*>(object + game::kSpriteObjectOwner);
+    if (!game::PlausiblePointer(car)) return;
+    const uint32_t mask = *reinterpret_cast<const uint32_t*>(car + game::kVehicleDeltaMask);
+    const int sprite = *reinterpret_cast<const uint16_t*>(object + game::kSpriteObjectNumber);
+    // Capture the fields while reading the game object, then copy the body
+    // before the first append can invalidate its element in sprites_.
+    const uint32_t lit = mask & *reinterpret_cast<const uint32_t*>(game::kLampMaskPtr);
+    AddCarLampQuads(body, lit, sprite);
+}
+
+void LiveGeometry::AddCarLampQuads(Sprite body, uint32_t lit, int sprite) {
+    if (body.corners != 4 || sprite < 0) return;
+    float u0 = body.local[0].u, u1 = u0, v0 = body.local[0].v, v1 = v0;
+    for (int i = 1; i < 4; ++i) {
+        u0 = (std::min)(u0, body.local[i].u);
+        u1 = (std::max)(u1, body.local[i].u);
+        v0 = (std::min)(v0, body.local[i].v);
+        v1 = (std::max)(v1, body.local[i].v);
+    }
+    if (u1 - u0 < 1e-6f || v1 - v0 < 1e-6f) return;
+    // Which corner is which, by its texture coordinates: 0 at the low end.
+    int corner[2][2] = {{0, 0}, {0, 0}};
+    for (int i = 0; i < 4; ++i) {
+        const int su = body.local[i].u > (u0 + u1) * 0.5f ? 1 : 0;
+        const int sv = body.local[i].v > (v0 + v1) * 0.5f ? 1 : 0;
+        corner[su][sv] = i;
+    }
+    auto at = [&](float u, float v) {
+        const float a = (u - u0) / (u1 - u0), b = (v - v0) / (v1 - v0);
+        const Vertex& p00 = body.local[corner[0][0]];
+        const Vertex& p10 = body.local[corner[1][0]];
+        const Vertex& p01 = body.local[corner[0][1]];
+        const Vertex& p11 = body.local[corner[1][1]];
+        Vertex out = p00;
+        out.x = (p00.x * (1 - a) + p10.x * a) * (1 - b) + (p01.x * (1 - a) + p11.x * a) * b;
+        out.y = (p00.y * (1 - a) + p10.y * a) * (1 - b) + (p01.y * (1 - a) + p11.y * a) * b;
+        out.z = (p00.z * (1 - a) + p10.z * a) * (1 - b) + (p01.z * (1 - a) + p11.z * a) * b;
+        return out;
+    };
+    // Above the body, whichever way its frame faces.
+    const float above = body.objectToWorld.m[1][1] >= 0.0f ? 1.0f : -1.0f;
+
+    // Exactly the bits the game is about to draw as its lamp quad: the car's own
+    // mask, cut down to the lamp mask FUN_004BE060 chose for this car.
+    for (int bit = 0; bit < 32; ++bit) {
+        if (!(lit & (1u << bit))) continue;
+        // FUN_0044AEA0's reading: from bit 22 up, delta bit - 17 mirrored.
+        const bool mirrored = bit >= game::kMirroredDeltaFirstBit;
+        const int delta = mirrored ? bit - game::kMirroredDeltaOffset : bit;
+        auto arts = g_lampArt.find(delta);
+        if (arts == g_lampArt.end() || sprite >= static_cast<int>(arts->second.size())) continue;
+        const LampArt& r = arts->second[sprite];
+        if (!r.Valid()) continue;
+        {
+            // The mirrored lamp is the same pixels flipped across the sprite.
+            const int rx0 = r.x0, rx1 = r.x0 + r.width;
+            const float px0 = static_cast<float>(mirrored ? r.spriteWidth - rx1 : rx0);
+            const float px1 = static_cast<float>(mirrored ? r.spriteWidth - rx0 : rx1);
+            const float tu0 = u0 + (u1 - u0) * px0 / r.spriteWidth;
+            const float tu1 = u0 + (u1 - u0) * px1 / r.spriteWidth;
+            const float tv0 = v0 + (v1 - v0) * static_cast<float>(r.y0) / r.spriteHeight;
+            const float tv1 = v0 + (v1 - v0) * static_cast<float>(r.y0 + r.height) / r.spriteHeight;
+            Sprite lamp = body;
+            lamp.texture = nullptr;
+            lamp.lamp = &r;
+            lamp.lampMirrored = mirrored;
+            const float us[4] = {tu0, tu1, tu1, tu0};
+            const float vs[4] = {tv0, tv0, tv1, tv1};
+            const float uvs[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+            for (int i = 0; i < 4; ++i) {
+                lamp.local[i] = at(us[i], vs[i]);
+                lamp.local[i].y += kConformClearance * above;
+                lamp.local[i].u = uvs[i][0];
+                lamp.local[i].v = uvs[i][1];
+            }
+            sprites_.push_back(lamp);
+            ++spriteQuads_;
+        }
+    }
+}
+
+void LiveGeometry::EnsureDraws(IDirect3DDevice9* device, bool recordStats) {
+    if (!drawsReady_ || drawDevice_ != device || drawSpriteCount_ != sprites_.size()) {
+      ClearDrawCache();
+      plainDraws_.reserve(sprites_.size());
+      for (const Sprite& sprite : sprites_) {
+        if (sprite.lamp) {
+            if (IDirect3DTexture9* lamp = LampTexture(device, sprite.lamp, sprite.lampMirrored)) {
+                lamp->AddRef();
+                plainDraws_.push_back({&sprite, lamp});
+            }
+            continue;
+        }
+        bool effect = false;
+        IDirect3DTexture9* texture = DeviceTextureFor(device, sprite.texture, &effect,
+                                                      !sprite.plain);
+        if (!texture) {
+            // The sprite was accepted and then had no artwork to draw with:
+            // this is a sprite that vanishes for exactly one frame.
+            if (recordStats) ++drops_.noTexture;
+            continue;
+        }
+        // Recorded so the texture report can tell a fireball from a road tile
+        // that happens to have a hole in it. See texture_store.h.
+        if (recordStats) NoteSpriteTexture(sprite.texture);
+        texture->AddRef();
+        (effect ? effectDraws_ : plainDraws_).push_back({&sprite, texture});
+      }
+      drawSpriteCount_ = sprites_.size();
+      drawDevice_ = device;
+      drawsReady_ = true;
+    }
+}
+
+void LiveGeometry::Draw(IDirect3DDevice9* device, const gta2::Camera& camera, int width,
+                        int height, bool recordStats) {
+    if (!device) return;
+    if (sprites_.empty()) return;
+
+    D3DMATRIX matrix;
+    // No world matrix here: each sprite sets its own, which is the whole point.
+    // See the note in live_geometry.h.
+    const gta2::Mat4 view = camera.ViewMatrix();
+    memcpy(&matrix, view.m, sizeof(matrix));
+    device->SetTransform(D3DTS_VIEW, &matrix);
+    const gta2::Mat4 projection =
+        camera.ProjectionMatrix(static_cast<float>(width) / static_cast<float>(height));
+    memcpy(&matrix, projection.m, sizeof(matrix));
+    device->SetTransform(D3DTS_PROJECTION, &matrix);
+
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    // Sprites are flat quads and the odd block faces come in either winding, so
+    // culling is off rather than guessed at.
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    const bool blending = gta2::GetAlphaMode() == gta2::AlphaMode::Blend;
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, blending ? TRUE : FALSE);
+    // An alpha test rather than blending: it keeps the geometry opaque to the
+    // path tracer, which behaves far better than a blended surface under Remix.
+    // Sprites were hardcoded to alpha test, which is why the mode switch appeared
+    // to do nothing to them: it only ever reached the static world mesh. An
+    // explosion is exactly the case that wants blending - it is a soft glow, not
+    // a cutout like a fence or a tree.
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+    device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+    // In blend mode the test drops to 1, which still discards the fully
+    // transparent texels so they do not write depth over what is behind them.
+    device->SetRenderState(D3DRS_ALPHAREF, blending ? 1u
+                                                    : static_cast<DWORD>(gta2::GetAlphaRef()));
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    gta2ceiling::ApplyWorldTextureFiltering(device);
+
+    device->SetFVF(kWorldFvf);
+
+    // Effect artwork - fire, explosions, muzzle flashes - is drawn in a second
+    // pass, so the texture has to be resolved before the pass is chosen. See
+    // texture_store.h for what makes a sprite an effect and why it matters.
+    EnsureDraws(device, recordStats);
+
+    // Two triangles from four corners, the same two every time. Indexed rather
+    // than a six-vertex list so the index buffer is part of the topological hash
+    // Remix buckets on, and so the quad really is four vertices rather than four
+    // with two duplicated.
+    static const uint16_t kQuadIndices[6] = {0, 1, 2, 0, 2, 3};
+
+    // The device is a state machine and the texture rarely changes between
+    // neighbouring sprites, so the redundant SetTexture calls are skipped. The
+    // world matrix genuinely changes every time and cannot be.
+    IDirect3DTexture9* bound = nullptr;
+    auto issue = [&](const std::vector<Drawable>& list, bool skipFree) {
+        for (size_t k = 0; k < list.size(); ++k) {
+            const Drawable& d = list[k];
+            if (skipFree && k < freeFlags_.size() && freeFlags_[k]) continue;  // walk out: DrawFree
+            D3DMATRIX world;
+            memcpy(&world, d.sprite->objectToWorld.m, sizeof(world));
+            device->SetTransform(D3DTS_WORLD, &world);
+            if (d.texture != bound) {
+                device->SetTexture(0, d.texture);
+                bound = d.texture;
+            }
+            gta2::DynamicDraw::Instance().DrawIndexed(device, D3DPT_TRIANGLELIST, 0, 4, 2, kQuadIndices,
+                                                      d.sprite->local, sizeof(Vertex));
+            if (recordStats) ++drops_.drawn;
+        }
+    };
+
+    // GTA2Ceiling: give cars and people a little body instead of a flat decal.
+    // Each sprite is stacked into a short slab ("sprite stacking"): darker
+    // copies form the sides, the original artwork sits on top. All of it is
+    // built once per simulation frame in world space and grouped by texture,
+    // so both eyes and every head-pose refresh issue only one draw per
+    // texture instead of one or more per sprite.
+    if (SpriteDepthOn()) {
+        if (!spriteBatchesReady_) BuildSpriteBatches();
+        const gta2::Mat4 identity = gta2::Identity();
+        memcpy(&matrix, identity.m, sizeof(matrix));
+        device->SetTransform(D3DTS_WORLD, &matrix);
+        device->SetFVF(kBatchFvf);
+        if (!shadowBatch_.vertices.empty()) {
+            if (IDirect3DTexture9* blob = BlobTexture(device)) {
+                // Blended, depth tested but not written, under the bodies.
+                device->SetTexture(0, blob);
+                bound = blob;
+                device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+                device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+                device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+                device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+                device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+                device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+                device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+                // Lies on the street itself: a small depth bias toward the
+                // viewer (about 1-2 mm) instead of a lift, so it never fights
+                // the street for depth and never floats visibly.
+                const float bias = -4.0e-5f, slope = -1.0f;
+                device->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&bias));
+                device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *reinterpret_cast<const DWORD*>(&slope));
+                gta2::DynamicDraw::Instance().DrawIndexed(device, D3DPT_TRIANGLELIST, 0,
+                    static_cast<UINT>(shadowBatch_.vertices.size()), static_cast<UINT>(shadowBatch_.indices.size() / 3),
+                    shadowBatch_.indices.data(), shadowBatch_.vertices.data(), sizeof(BatchVertex));
+                device->SetRenderState(D3DRS_DEPTHBIAS, 0);
+                device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
+                device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+                device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+                device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+                device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+                device->SetRenderState(D3DRS_ALPHABLENDENABLE,
+                    gta2::GetAlphaMode() == gta2::AlphaMode::Blend ? TRUE : FALSE);
+            }
+        }
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        for (const SpriteBatch& batch : spriteBatches_) {
+            if (batch.vertices.empty()) continue;
+            if (batch.texture != bound) {
+                device->SetTexture(0, batch.texture);
+                bound = batch.texture;
+            }
+            gta2::DynamicDraw::Instance().DrawIndexed(device, D3DPT_TRIANGLELIST, 0,
+                static_cast<UINT>(batch.vertices.size()), static_cast<UINT>(batch.indices.size() / 3),
+                batch.indices.data(), batch.vertices.data(), sizeof(BatchVertex));
+        }
+        if (recordStats) drops_.drawn += static_cast<int>(plainDraws_.size());
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        device->SetFVF(kWorldFvf);
+    } else {
+        if (!freeReady_) PrepareFree();
+        if (freeFound_ && freeBatches_.empty()) {
+            std::vector<Drawable> player;
+            for (size_t k = 0; k < plainDraws_.size(); ++k)
+                if (k < freeFlags_.size() && freeFlags_[k]) player.push_back(plainDraws_[k]);
+            AppendBodies(player, freeBatches_, false);
+        }
+        issue(plainDraws_, true);
+    }
+
+    if (!effectDraws_.empty()) {
+        // Additive, which is what this artwork was drawn for: it fades to black
+        // on its way out, and black adds nothing. The rim disappears because it
+        // stops being painted at all rather than because anything was cut out of
+        // it, and the fireball ends up a glow over the scene the way it should.
+        //
+        // Remix treats additively blended draws as emissive particles, so this is
+        // also the classification that gets a fireball to light the street rather
+        // than sit on it as a flat decal.
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+        // Still depth *tested*, so a fire behind a wall stays behind it, but not
+        // depth written: a glow must not stop what is drawn after it.
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        issue(effectDraws_, false);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    }
+    effectQuads_ = static_cast<int>(effectDraws_.size());
+    g_effectBatches = effectQuads_;
+
+    device->SetTexture(0, nullptr);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    // Left as we found it, so the next pass that assumes a world matrix - and the
+    // static mesh does - is not drawing at the last sprite's position.
+    const gta2::Mat4 identity = gta2::Identity();
+    memcpy(&matrix, identity.m, sizeof(matrix));
+    device->SetTransform(D3DTS_WORLD, &matrix);
+}
+
+IDirect3DTexture9* LiveGeometry::BlobTexture(IDirect3DDevice9* device) {
+    if (blobTexture_ && blobDevice_ == device) return blobTexture_;
+    if (blobTexture_) { blobTexture_->Release(); blobTexture_ = nullptr; }
+    constexpr int kSize = 32;
+    if (FAILED(device->CreateTexture(kSize, kSize, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &blobTexture_, nullptr)))
+        return blobTexture_ = nullptr;
+    D3DLOCKED_RECT lock{};
+    if (SUCCEEDED(blobTexture_->LockRect(0, &lock, nullptr, 0))) {
+        for (int y = 0; y < kSize; ++y) {
+            auto* row = reinterpret_cast<uint32_t*>(static_cast<char*>(lock.pBits) + y * lock.Pitch);
+            for (int x = 0; x < kSize; ++x) {
+                const float dx = (x + 0.5f) / kSize * 2 - 1, dy = (y + 0.5f) / kSize * 2 - 1;
+                const float r = std::sqrt(dx * dx + dy * dy);
+                const float a = r >= 1.0f ? 0.0f : (1.0f - r * r) * (1.0f - r * r);
+                row[x] = static_cast<uint32_t>(a * 255.0f + 0.5f) << 24;  // black, soft alpha
+            }
+        }
+        blobTexture_->UnlockRect(0);
+    }
+    blobDevice_ = device;
+    return blobTexture_;
+}
+
+namespace {
+void SpriteCentre(const gta2::Mat4& m, const LiveGeometry::Vertex* local, int corners, float out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    for (int i = 0; i < corners; ++i)
+        for (int c = 0; c < 3; ++c)
+            out[c] += (local[i].x * m.m[0][c] + local[i].y * m.m[1][c] + local[i].z * m.m[2][c] + m.m[3][c]) / corners;
+}
+}  // namespace
+
+bool LiveGeometry::SpriteNear(float x, float z, float reach, FocusInfo* out) const {
+    float best = reach * reach;
+    bool found = false;
+    for (const Sprite& s : sprites_) {
+        if (s.lamp || s.plain || s.flat || (s.corners != 4 && s.corners != 3)) continue;
+        float c[3];
+        SpriteCentre(s.objectToWorld, s.local, s.corners, c);
+        const float d2 = (c[0] - x) * (c[0] - x) + (c[2] - z) * (c[2] - z);
+        if (d2 > best) continue;
+        best = d2;
+        found = true;
+        if (out) {
+            float x0 = s.local[0].x, x1 = x0, z0 = s.local[0].z, z1 = z0;
+            for (int i = 1; i < s.corners; ++i) {
+                x0 = (std::min)(x0, s.local[i].x); x1 = (std::max)(x1, s.local[i].x);
+                z0 = (std::min)(z0, s.local[i].z); z1 = (std::max)(z1, s.local[i].z);
+            }
+            out->x = c[0]; out->y = c[1]; out->z = c[2];
+            out->heading = std::atan2(s.objectToWorld.m[0][2], s.objectToWorld.m[0][0]);
+            out->area = (x1 - x0) * (z1 - z0);
+        }
+    }
+    return found;
+}
+
+void LiveGeometry::PrepareFree() {
+    freeReady_ = true;
+    freeFound_ = false;
+    freeSwitched_ = false;
+    freeCount_ = 0;
+    freeFlags_.assign(plainDraws_.size(), 0);
+    if (!freeOn_ || plainDraws_.empty()) return;
+    // Candidates: bodies (not lamps, not power-up tokens) and their footprint.
+    struct Candidate { size_t index; float c[3]; float area; };
+    std::vector<Candidate> candidates;
+    candidates.reserve(plainDraws_.size());
+    for (size_t k = 0; k < plainDraws_.size(); ++k) {
+        const Sprite& s = *plainDraws_[k].sprite;
+        if (s.lamp || s.plain || s.flat || (s.corners != 4 && s.corners != 3)) continue;
+        Candidate c{k, {}, 0};
+        SpriteCentre(s.objectToWorld, s.local, s.corners, c.c);
+        float x0 = s.local[0].x, x1 = x0, z0 = s.local[0].z, z1 = z0;
+        for (int i = 1; i < s.corners; ++i) {
+            x0 = (std::min)(x0, s.local[i].x); x1 = (std::max)(x1, s.local[i].x);
+            z0 = (std::min)(z0, s.local[i].z); z1 = (std::max)(z1, s.local[i].z);
+        }
+        c.area = (x1 - x0) * (z1 - z0);
+        candidates.push_back(c);
+    }
+    auto distance = [](const Candidate& c, float x, float z) {
+        return std::sqrt((c.c[0] - x) * (c.c[0] - x) + (c.c[2] - z) * (c.c[2] - z));
+    };
+    const Candidate* nearCamera = nullptr;
+    for (const Candidate& c : candidates) {
+        const float d = distance(c, freeCameraX_, freeCameraZ_);
+        if (d < 2.5f && (!nearCamera || d < distance(*nearCamera, freeCameraX_, freeCameraZ_))) nearCamera = &c;
+    }
+    // The person sprites of this frame, kept for the next one.
+    std::vector<std::pair<float, float>> people;
+    for (const Candidate& c : candidates) if (c.area <= 0.15f) people.emplace_back(c.c[0], c.c[2]);
+    auto isNew = [&](const Candidate& c) {
+        for (const auto& p : freePeople_) {
+            const float dx = p.first - c.c[0], dz = p.second - c.c[2];
+            if (dx * dx + dz * dz < 0.5f * 0.5f) return false;
+        }
+        return true;
+    };
+    auto nearest = [&](float x, float z, float reach, int kind) {  // kind: 1 car, 0 person, -1 any
+        const Candidate* best = nullptr;
+        for (const Candidate& c : candidates) {
+            if (kind >= 0 && (c.area > 0.15f) != (kind == 1)) continue;
+            const float d = distance(c, x, z);
+            if (d < reach && (!best || d < distance(*best, x, z))) best = &c;
+        }
+        return best;
+    };
+    const Candidate* focus = nullptr;
+    if (freeTracking_ && freeArea_ < 0.0f) {
+        // Exact: the game's own player object is right there.
+        focus = nearest(freePredictedX_, freePredictedZ_, 0.4f, -1);
+        if (!focus) focus = nearest(freePredictedX_, freePredictedZ_, 1.0f, -1);
+    } else if (!freeTracking_) {
+        focus = nearCamera;
+    } else {
+        const bool vehicle = freeArea_ > 0.15f;
+        focus = nearest(freePredictedX_, freePredictedZ_, 1.0f, vehicle ? 1 : 0);
+        if (vehicle && focus && freeSpeed_ < 0.03f) {
+            // Getting out: a person who was not there before, right by the car.
+            for (const Candidate& c : candidates)
+                if (c.area <= 0.15f && distance(c, focus->c[0], focus->c[2]) < 1.0f && isNew(c)) {
+                    focus = &c;
+                    freeSwitched_ = true;
+                    break;
+                }
+        }
+        if (!focus && !vehicle) {
+            // Getting in: the person is gone, the car is where it stood.
+            focus = nearest(freePredictedX_, freePredictedZ_, 1.6f, 1);
+            if (focus) freeSwitched_ = true;
+        }
+        if (!focus) focus = nearest(freePredictedX_, freePredictedZ_, 0.5f, -1);
+    }
+    freePeople_.swap(people);
+    if (!focus) return;
+    const Sprite& f = *plainDraws_[focus->index].sprite;
+    freeFocus_.x = focus->c[0]; freeFocus_.y = focus->c[1]; freeFocus_.z = focus->c[2];
+    freeFocus_.heading = std::atan2(f.objectToWorld.m[0][2], f.objectToWorld.m[0][0]);
+    freeFocus_.area = focus->area;
+    freeFound_ = true;
+    // Part of the player: its own lamp quads (lying on its footprint) and what
+    // the game stacks exactly on its body (same centre, not larger). Nothing
+    // else - a pedestrian it touches stays inside the disc's clip.
+    float x0 = f.local[0].x, x1 = x0, z0 = f.local[0].z, z1 = z0;
+    for (int i = 1; i < f.corners; ++i) {
+        x0 = (std::min)(x0, f.local[i].x); x1 = (std::max)(x1, f.local[i].x);
+        z0 = (std::min)(z0, f.local[i].z); z1 = (std::max)(z1, f.local[i].z);
+    }
+    const gta2::Mat4& m = f.objectToWorld;
+    const float axisX = m.m[0][0] * m.m[0][0] + m.m[0][1] * m.m[0][1] + m.m[0][2] * m.m[0][2];
+    const float axisZ = m.m[2][0] * m.m[2][0] + m.m[2][1] * m.m[2][1] + m.m[2][2] * m.m[2][2];
+    constexpr float kMargin = 0.08f;
+    for (size_t k = 0; k < plainDraws_.size(); ++k) {
+        if (k == focus->index) { freeFlags_[k] = 1; ++freeCount_; continue; }
+        const Sprite& s = *plainDraws_[k].sprite;
+        if (s.flat || s.corners < 3 || s.corners > 4 || axisX <= 1e-8f || axisZ <= 1e-8f) continue;
+        float c[3];
+        SpriteCentre(s.objectToWorld, s.local, s.corners, c);
+        const float px = c[0] - m.m[3][0], py = c[1] - m.m[3][1], pz = c[2] - m.m[3][2];
+        if (std::fabs(c[1] - freeFocus_.y) > 0.75f) continue;
+        const float lx = (px * m.m[0][0] + py * m.m[0][1] + pz * m.m[0][2]) / axisX;
+        const float lz = (px * m.m[2][0] + py * m.m[2][1] + pz * m.m[2][2]) / axisZ;
+        if (lx < x0 - kMargin || lx > x1 + kMargin || lz < z0 - kMargin || lz > z1 + kMargin) continue;
+        if (!s.lamp) {
+            const float dx = c[0] - freeFocus_.x, dz = c[2] - freeFocus_.z;
+            float sx0 = s.local[0].x, sx1 = sx0, sz0 = s.local[0].z, sz1 = sz0;
+            for (int i = 1; i < s.corners; ++i) {
+                sx0 = (std::min)(sx0, s.local[i].x); sx1 = (std::max)(sx1, s.local[i].x);
+                sz0 = (std::min)(sz0, s.local[i].z); sz1 = (std::max)(sz1, s.local[i].z);
+            }
+            if (dx * dx + dz * dz > 0.15f * 0.15f || (sx1 - sx0) * (sz1 - sz0) > 1.3f * focus->area) continue;
+        }
+        freeFlags_[k] = 1;
+        ++freeCount_;
+    }
+}
+
+void LiveGeometry::DrawFree(IDirect3DDevice9* device, const gta2::Camera& camera, int width, int height,
+                            bool recordStats) {
+    if (!device || sprites_.empty()) return;
+    // Drawn on its own, before the city (see WorldView::RenderStereo), so it
+    // sets up everything Draw would and builds this frame's batches itself.
+    D3DMATRIX matrix;
+    const gta2::Mat4 view = camera.ViewMatrix();
+    memcpy(&matrix, view.m, sizeof(matrix));
+    device->SetTransform(D3DTS_VIEW, &matrix);
+    const gta2::Mat4 projection = camera.ProjectionMatrix(static_cast<float>(width) / static_cast<float>(height));
+    memcpy(&matrix, projection.m, sizeof(matrix));
+    device->SetTransform(D3DTS_PROJECTION, &matrix);
+    EnsureDraws(device, recordStats);
+    if (SpriteDepthOn()) {
+        if (!spriteBatchesReady_) BuildSpriteBatches();
+    } else {
+        if (!freeReady_) PrepareFree();
+        if (freeFound_ && freeBatches_.empty()) {
+            std::vector<Drawable> player;
+            for (size_t k = 0; k < plainDraws_.size(); ++k)
+                if (k < freeFlags_.size() && freeFlags_[k]) player.push_back(plainDraws_[k]);
+            AppendBodies(player, freeBatches_, false);
+        }
+    }
+    if (freeBatches_.empty()) return;
+    const gta2::Mat4 identity = gta2::Identity();
+    memcpy(&matrix, identity.m, sizeof(matrix));
+    device->SetTransform(D3DTS_WORLD, &matrix);
+    device->SetFVF(kBatchFvf);
+    const bool blending = gta2::GetAlphaMode() == gta2::AlphaMode::Blend;
+    device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, blending ? TRUE : FALSE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+    device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+    device->SetRenderState(D3DRS_ALPHAREF, blending ? 1u : static_cast<DWORD>(gta2::GetAlphaRef()));
+    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    gta2ceiling::ApplyWorldTextureFiltering(device);
+    for (const SpriteBatch& batch : freeBatches_) {
+        if (batch.vertices.empty()) continue;
+        device->SetTexture(0, batch.texture);
+        gta2::DynamicDraw::Instance().DrawIndexed(device, D3DPT_TRIANGLELIST, 0,
+            static_cast<UINT>(batch.vertices.size()), static_cast<UINT>(batch.indices.size() / 3),
+            batch.indices.data(), batch.vertices.data(), sizeof(BatchVertex));
+    }
+    device->SetTexture(0, nullptr);
+    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetFVF(kWorldFvf);
+}
+
+void LiveGeometry::BuildSpriteBatches() {
+    spriteBatches_.clear();
+    freeBatches_.clear();
+    shadowBatch_.vertices.clear();
+    shadowBatch_.indices.clear();
+    if (!freeReady_) PrepareFree();
+    if (freeFound_) {
+        std::vector<Drawable> city, player;
+        city.reserve(plainDraws_.size());
+        for (size_t k = 0; k < plainDraws_.size(); ++k)
+            (k < freeFlags_.size() && freeFlags_[k] ? player : city).push_back(plainDraws_[k]);
+        AppendBodies(city, spriteBatches_, true);
+        AppendBodies(player, freeBatches_, false);
+    } else {
+        AppendBodies(plainDraws_, spriteBatches_, true);
+    }
+    spriteBatchesReady_ = true;
+}
+
+void LiveGeometry::AppendBodies(const std::vector<Drawable>& list, std::vector<SpriteBatch>& batches,
+                                bool shadows) {
+    std::map<IDirect3DTexture9*, size_t> slot;
+    auto transform = [](const gta2::Mat4& m, float x, float y, float z, float out[3]) {
+        for (int c = 0; c < 3; ++c)
+            out[c] = x * m.m[0][c] + y * m.m[1][c] + z * m.m[2][c] + m.m[3][c];
+    };
+    for (const Drawable& d : list) {
+        const Sprite& s = *d.sprite;
+        auto found = slot.find(d.texture);
+        if (found == slot.end() || batches[found->second].vertices.size() > 60000) {
+            found = slot.insert_or_assign(d.texture, batches.size()).first;
+            batches.push_back({d.texture, {}, {}});
+        }
+        SpriteBatch& batch = batches[found->second];
+        auto quad = [&](float lift, DWORD colour) {
+            const uint16_t base = static_cast<uint16_t>(batch.vertices.size());
+            for (int i = 0; i < s.corners; ++i) {
+                BatchVertex v{};
+                float p[3];
+                transform(s.objectToWorld, s.local[i].x, s.local[i].y + lift, s.local[i].z, p);
+                v.x = p[0]; v.y = p[1]; v.z = p[2];
+                v.colour = colour; v.u = s.local[i].u; v.v = s.local[i].v;
+                batch.vertices.push_back(v);
+            }
+            const int tris = s.corners == 4 ? 2 : 1;
+            static const uint16_t q[6] = {0, 1, 2, 0, 2, 3};
+            for (int i = 0; i < tris * 3; ++i) batch.indices.push_back(static_cast<uint16_t>(base + q[i]));
+        };
+        if (s.plain || s.flat || (s.corners != 4 && s.corners != 3)) { quad(0, 0xFFFFFFFFu); continue; }
+        float x0 = s.local[0].x, x1 = x0, z0 = s.local[0].z, z1 = z0;
+        for (int i = 1; i < s.corners; ++i) {
+            x0 = (std::min)(x0, s.local[i].x); x1 = (std::max)(x1, s.local[i].x);
+            z0 = (std::min)(z0, s.local[i].z); z1 = (std::max)(z1, s.local[i].z);
+        }
+        // Own lamp quads are tiny but belong to a car body.
+        const bool vehicle = s.lamp != nullptr || (x1 - x0) * (z1 - z0) > 0.15f;
+        const float depth = vehicle ? kVehicleDepth : kPersonDepth;
+        const float above = s.objectToWorld.m[1][1] >= 0.0f ? 1.0f : -1.0f;
+        if (shadows && !s.lamp && g_contactShadows && shadowBatch_.vertices.size() < 60000) {
+            // Soft contact shadow: a dark ellipse just under the body, a bit
+            // larger than its footprint, so the car or person sits on the street.
+            const float cx = 0.5f * (x0 + x1), cz = 0.5f * (z0 + z1);
+            const float hx = 0.65f * (x1 - x0) + 0.04f, hz = 0.65f * (z1 - z0) + 0.04f;
+            const float y = s.local[0].y;
+            const float corners[4][4] = {{cx - hx, cz - hz, 0, 0}, {cx + hx, cz - hz, 1, 0},
+                                         {cx + hx, cz + hz, 1, 1}, {cx - hx, cz + hz, 0, 1}};
+            const uint16_t base = static_cast<uint16_t>(shadowBatch_.vertices.size());
+            for (const auto& c : corners) {
+                float p[3];
+                transform(s.objectToWorld, c[0], y, c[1], p);
+                shadowBatch_.vertices.push_back({p[0], p[1], p[2], D3DCOLOR_ARGB(150, 0, 0, 0), c[2], c[3]});
+            }
+            static const uint16_t q[6] = {0, 1, 2, 0, 2, 3};
+            for (uint16_t i : q) shadowBatch_.indices.push_back(static_cast<uint16_t>(base + i));
+        }
+        // A small lift keeps the lowest (darkest) layer off the street plane.
+        constexpr float kBodyLift = 0.01f;
+        if (!s.lamp) {
+            const int kLayers = g_spriteDepthLayers;
+            for (int l = 0; l < kLayers; ++l) {
+                // Darker towards the ground: reads as shaded sides.
+                const int grey = 120 + l * 96 / kLayers;
+                quad(above * (kBodyLift + depth * static_cast<float>(l) / kLayers),
+                     D3DCOLOR_ARGB(255, grey, grey, grey));
+            }
+        }
+        quad(above * ((s.lamp ? 0.0f : kBodyLift) + depth), 0xFFFFFFFFu);
+    }
+}
+
+void LiveGeometry::ClearDrawCache() {
+    spriteBatches_.clear();
+    spriteBatchesReady_ = false;
+    freeBatches_.clear();
+    freeFlags_.clear();
+    freeReady_ = false;
+    freeFound_ = false;
+    freeSwitched_ = false;
+    freeCount_ = 0;
+    for (const auto& draw : plainDraws_) draw.texture->Release();
+    for (const auto& draw : effectDraws_) draw.texture->Release();
+    plainDraws_.clear();
+    effectDraws_.clear();
+    drawsReady_ = false;
+    drawDevice_ = nullptr;
+    drawSpriteCount_ = 0;
+}
+
+void LiveGeometry::ReleaseResources() {
+    ClearDrawCache();
+    if (blobTexture_) { blobTexture_->Release(); blobTexture_ = nullptr; }
+    blobDevice_ = nullptr;
+    sprites_.clear();
+    ReleaseLampTextures();
+    g_lampDevice = nullptr;
+    spriteQuads_ = 0;
+    effectQuads_ = 0;
+    // The shapes are keyed by texture record, and a new level hands out new ones.
+    g_shapes.clear();
+}
+
+}  // namespace gta2dx9

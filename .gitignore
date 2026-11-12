@@ -1,0 +1,50 @@
+# Private original game data and user saves
+/local/
+/private/
+/game/
+/gta2/
+/user-data/
+/captures/
+*.gmp
+*.sty
+*.scr
+*.gxt
+*.bik
+*.m3d
+*.sav
+
+# Binaries, archives and build outputs: only in the external work root
+*.exe
+*.dll
+*.apk
+*.aab
+*.so
+*.obj
+*.o
+*.lib
+*.a
+*.pdb
+*.zip
+*.7z
+*.log
+/build/
+/out/
+/release/
+/dist/
+/work/
+/tmp/
+/.gradle/
+/.cxx/
+/.vs/
+__pycache__/
+local.properties
+*.local.json
+*.keystore
+*.jks
+
+# Machine-specific tool settings
+tools/local.settings.ps1
+
+# Local agent instructions and scratch notes (not part of the public project)
+/AGENTS.md
+/Start.txt

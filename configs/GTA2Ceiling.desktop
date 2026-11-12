@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=GTA2Ceiling
+Type=Application
+Exec=wine C:/windows/system32/cmd.exe
+
+[Extra Data]
+autoclose=0
+execArgs=/d /c D:\GTA2Ceiling\gta2\StartGTA2Ceiling.cmd
+screenSize=3072x1536
+useReshade=3
+use_pt=1
+xr_colour_key=3
+xr_colour_key_tolerance=10
+gcc_exact_colour_key=1

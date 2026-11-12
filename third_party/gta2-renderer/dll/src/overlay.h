@@ -1,0 +1,188 @@
+// The screen-space layer: HUD, menus, and sprites.
+//
+// GTA2 draws everything that is not world geometry through a handful of
+// entry points that all take vertices it has already transformed itself
+// (gbh_DrawQuad, gbh_DrawTriangle, gbh_DrawFlatRect, gbh_BlitImage). The
+// world renderer deliberately ignores that stream, which is why the HUD,
+// the menus and every car and pedestrian were missing entirely.
+//
+// This replays that stream as a 2D pass drawn on top of the world. It is
+// pre-transformed by construction, so RTX Remix will classify it as UI and
+// leave it out of the path traced image - correct for the HUD, and a known
+// limitation for sprites until they are rebuilt as world-space billboards.
+//
+// The layout below is not guesswork: the original renderer takes
+// D3DFVF_XYZRHW|DIFFUSE|SPECULAR|TEX1 (0x1C4), a 32-byte vertex, and draws
+// four of them as a triangle fan (d3ddll.dll!FUN_00e02cc0).
+#pragma once
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <cstdint>
+#include <d3d9.h>
+#include <vector>
+
+#include "plugin_draw.h"
+
+namespace gta2dx9 {
+
+// How GTA2's own screen is fitted to a back buffer of a different shape.
+//
+// The game lays its front end out at 640x480 and its HUD at whatever its options
+// screen was set to - both 4:3 - while the path traced image is the size of the
+// display. Scaling each axis to fill therefore stretches 4:3 artwork across a
+// 16:9 screen by a third, which is subtle on text and obvious on anything round:
+// the ring on the front-end photograph comes out a clear ellipse.
+enum class HudFitMode {
+    Fit,         // one scale for both axes, centred - a circle stays a circle
+    Stretch,     // fill the back buffer, which is what the original renderer did
+    Widescreen,  // Fit, but the HUD's elements go out to the edges they belong to
+};
+
+void SetHudFit(HudFitMode mode);
+HudFitMode HudFit();
+
+// Flag bits the original renderer acts on, from d3ddll.dll!FUN_00e02cc0 and the
+// blend setup it calls, FUN_00e02960. gta2.exe builds them in FUN_004cb050 from
+// a draw mode: 0 plain (0x80), 1 translucent (0x2180, with the alpha in the
+// vertex colours), 2 additive (0x2280).
+namespace quad_flags {
+constexpr unsigned kVertexColour = 0x2000;   // diffuse is already in the vertices
+constexpr unsigned kExpandFromTexture = 0x10000;  // only vertex 0 is filled in
+constexpr unsigned kOpaque = 0x300;          // no colour key on this texture
+constexpr unsigned kAdditive = 0x200;        // ONE, ONE
+constexpr unsigned kPointSample = 0x20000;   // nearest; everything else is bilinear
+}  // namespace quad_flags
+
+class Overlay {
+public:
+    // Screen coordinates arrive in the game's own resolution, which is not the
+    // size of our back buffer; everything is scaled on the way out.
+    // The size the game lays its HUD out in, taken from the camera struct.
+    // Only valid while a world is loaded - see RevertToWindowSize.
+    void SetGameScreenSize(int width, int height);
+
+    // Go back to the size gbh_SetWindow last stated. The camera struct outlives
+    // the level it described, so once the game is back at the menu it is not a
+    // source of truth about anything.
+    void RevertToWindowSize();
+
+    // Log the next `frames` frames of the 2D draw list: what the game asked for,
+    // in the order it asked, with the artwork and the colour of each. The menu
+    // is entirely this stream, so when it comes out wrong this says whether the
+    // game did not send the draw or we did not honour it.
+    void TraceNextFrames(int frames);
+    void NoteWindow(float a, float b, float c, float d);
+
+    void BeginFrame();
+    void Quad(unsigned flags, const void* texture, const float* vertices, uint8_t shade);
+    void Triangle(unsigned flags, const void* texture, const float* vertices, uint8_t shade);
+    void FlatRect(const float* vertices, uint32_t colour);
+    void Line(int x1, int y1, int x2, int y2, uint32_t colour);
+
+    // gbh_LoadImage is handed a 16-bit uncompressed TGA; gbh_BlitImage copies a
+    // sub-rectangle of one to the screen. Menu backgrounds arrive this way.
+    //
+    // BlitImage returns what the original's did, because the game acts on it: 0
+    // for a blit, -1 for no such image, -2 for a source rectangle outside it, -3
+    // for a destination off the screen. See the note on the definition.
+    void InitImageTable(int count);
+    void FreeImageTable();
+    int LoadImage(const void* tga);
+    int BlitImage(int image, int srcX1, int srcY1, int srcX2, int srcY2, int dstX, int dstY);
+
+    // A frame of the intro movie, 32-bit B,G,R,X rows, drawn over the whole of the
+    // game's screen. See intro_movie.cpp. EndMovie lets the last frame go.
+    void MovieFrame(const void* pixels, int width, int height, int pitch);
+    void EndMovie();
+
+    // What a plugin draws through the stand-in DirectX 6 device - see
+    // plugin_draw.h. Its textures live in a table of their own, so the game's
+    // image table, which it frees and refills per level, never sees them.
+    int CreatePluginImage(int width, int height, const uint32_t* argb);
+    void UpdatePluginImage(int id, int width, int height, const uint32_t* argb);
+    void ReleasePluginImage(int id);
+    void PluginPrimitives(PluginPrimitive type, const PluginVertex* vertices, int count, int image,
+                          bool additive, bool linear);
+
+    void Flush(IDirect3DDevice9* device, int targetWidth, int targetHeight);
+    void ReleaseResources();
+
+    int DrawCount() const { return static_cast<int>(draws_.size()); }
+
+private:
+    struct Vertex {
+        float x, y, z, rhw;
+        uint32_t colour;
+        float u, v;
+    };
+
+    struct Draw {
+        const void* texture;   // TextureRecord*, or null for untextured
+        int image;             // image-table entry, or -1
+        uint32_t first;        // index into vertices_
+        uint32_t count;        // 3 or 6
+        bool alphaTest;
+        bool additive;         // quad_flags::kAdditive
+        bool pointSample;      // quad_flags::kPointSample or kExpandFromTexture
+        bool hud;              // drawn from the game's HUD pass, see hud_pass.h
+        int8_t part;           // which part of the HUD, or -1; see HudPassPart
+        int pluginImage = -1;  // a plugin texture, see CreatePluginImage
+    };
+
+    // Where each draw goes across the screen, as an offset added after scaling.
+    // Everything is centred, except in HudFitMode::Widescreen, where the HUD's
+    // elements are moved out to the edge they sit against. See the .cpp.
+    std::vector<float> HorizontalOffsets(float scale, float centred) const;
+
+    // How a draw blends and samples, from the game's flags. See quad_flags.
+    struct Style {
+        bool alphaTest = false;
+        bool additive = false;
+        bool pointSample = true;
+    };
+    static Style StyleFor(unsigned flags);
+
+    struct Image {
+        IDirect3DTexture9* texture = nullptr;
+        std::vector<uint32_t> pixels;
+        int width = 0, height = 0;
+    };
+
+    void PushTriangleFan(const Vertex* corners, int count, const void* texture, int image,
+                         const Style& style);
+    IDirect3DTexture9* ResolveImage(IDirect3DDevice9* device, int image);
+    IDirect3DTexture9* ResolveMovie(IDirect3DDevice9* device);
+    // gbh_ConvertColour returns 5:6:5; this expands it. See FlatRect.
+    static uint32_t PanelColour(uint32_t colour);
+
+    std::vector<Vertex> vertices_;
+    std::vector<Draw> draws_;
+    std::vector<Image> images_;
+    std::vector<Image> pluginImages_;   // see CreatePluginImage; empty pixels = free
+    IDirect3DTexture9* ResolvePluginImage(IDirect3DDevice9* device, int id);
+    // The movie frame, kept out of the image table: the game frees and resizes
+    // that table itself.
+    Image movie_;
+    bool movieChanged_ = false;
+
+    int gameWidth_ = 640;
+    int gameHeight_ = 480;
+    // The last thing gbh_SetWindow said, kept even while the camera struct is
+    // driving the size, so there is something to fall back to at the menu.
+    int windowWidth_ = 0;
+    int windowHeight_ = 0;
+    // Draws dropped this frame because the artwork they asked for was not there.
+    int missingArtwork_ = 0;
+    int missingLogged_ = 0;
+    int traceFrames_ = 0;
+    size_t lastSignature_ = 0;
+    int changeLogged_ = 0;
+    int diffLogged_ = 0;
+
+    std::vector<const void*> lastKeys_;
+    bool sizeFromWindow_ = false;
+};
+
+}  // namespace gta2dx9

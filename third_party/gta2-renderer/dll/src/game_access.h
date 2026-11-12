@@ -1,0 +1,583 @@
+// Direct in-process access to gta2.exe's world state.
+//
+// Same globals the out-of-process probe used, but as plain pointers now that we
+// run inside the game. Addresses were recovered from the world render loop
+// (FUN_00472110) and the per-cell block draw (FUN_00471f20); image base 0x400000.
+#pragma once
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <cstdint>
+
+namespace game {
+
+constexpr uintptr_t kCameraStructPtr = 0x005E3CC4;
+constexpr uintptr_t kMapHolderPtr = 0x00662C08;
+constexpr uintptr_t kMainWindowPtr = 0x00673D18;
+
+// World coordinates are 16.14 fixed point, one unit per map block.
+constexpr float kFixedScale = 1.0f / (1 << 14);
+
+// Camera struct layout, as used by the game's own projection (FUN_0046bd40):
+//   screen = camera[+0x70/+0x74] + scale * project(world - camera[+0x98/+0x9C])
+//
+// All of these are 16.14 fixed point except the two screen fields, which are
+// plain pixel integers.
+constexpr uintptr_t kCameraXOffset = 0x98;
+constexpr uintptr_t kCameraYOffset = 0x9C;
+constexpr uintptr_t kScreenWidthOffset = 0x68;    // pixels, integer
+constexpr uintptr_t kScreenHeightOffset = 0x6C;
+constexpr uintptr_t kScreenCentreXOffset = 0x70;
+constexpr uintptr_t kScreenCentreYOffset = 0x74;
+
+// The visible extent, in tiles. This is the game's real zoom: the rectangle
+// passed to gbh_SetCamera is the same window rounded out to whole tiles, so it
+// re-snaps as the camera moves sub-tile and is useless as a zoom source.
+constexpr uintptr_t kViewMinXOffset = 0x78;
+constexpr uintptr_t kViewMaxXOffset = 0x7C;
+constexpr uintptr_t kViewMinYOffset = 0x80;
+constexpr uintptr_t kViewMaxYOffset = 0x84;
+
+// Vertical squash the game applies to the world; 0.8875 in practice.
+constexpr uintptr_t kVerticalScaleOffset = 0x94;
+
+// Set from the `lighting` config option by FUN_004cb1d0, default on. While it is
+// clear the game never calls gbh_ResetLights or gbh_AddLight, so the Remix light
+// injection has nothing to work with and the menu says so rather than looking
+// broken.
+constexpr uintptr_t kLightingEnabledFlag = 0x00595011;
+
+inline bool LightingEnabled() {
+    return *reinterpret_cast<const uint8_t*>(kLightingEnabledFlag) != 0;
+}
+
+// GTA2's blood switch, one of the thirty-odd debug flags FUN_00451930 reads at
+// startup. The ped death handler, FUN_004411b0, ends by putting a blood pool
+// under the body (FUN_0048cc50, a particle-manager object that grows through
+// code_obj 497-502) - but only while this byte is set, and the retail game sets
+// it only if a value named do_blood exists under
+// HKLM\SOFTWARE\DMA Design Ltd\GTA2\Debug, or through a pair of debug cheats in
+// FUN_004590f0. So out of the box nobody bleeds. Plain .data, writable as is.
+constexpr uintptr_t kDoBloodFlag = 0x005EAD51;
+
+// The intro movie, data\movie\intro.bik, played by movie.cpp through binkw32.
+// See intro_movie.cpp for what goes wrong with it and what is changed.
+//
+// Whether it plays is do_play_movie under ...\GTA2\Screen, read through the
+// game's registry helper FUN_004b5660 - a __thiscall on the registry object at
+// 0x0066C6B4 taking (name, default) and ending in `ret 8`. Two call sites read
+// it: startup (0x004D144D) and the front end (0x00459690).
+constexpr uintptr_t kReadRegistryInt = 0x004B5660;
+constexpr uintptr_t kPlayMovieReadStartup = 0x004D144D;
+constexpr uintptr_t kPlayMovieReadFrontEnd = 0x00459690;
+
+// FUN_00481df0: `[0x673580] == 2`, the renderer being 3dfx.dll. Only the movie
+// asks, at open (0x00481F5A) and on every frame (0x00481E21). True means Bink
+// decodes into the game's own video surface; false means Bink opens a DirectDraw
+// buffer of its own on the game window and blits to it.
+constexpr uintptr_t kMovieUsesGameSurface = 0x00481DF0;
+
+// On the video-surface path each frame is: lock (FUN_004caec0 - Vid_GetSurface,
+// MakeScreenTable, gbh_SetWindow), BinkCopyToBuffer into the context's surface,
+// unlock (FUN_004caf50 - Vid_FreeSurface), Vid_FlipBuffers, Vid_ClearScreen.
+constexpr uintptr_t kMovieLockCall = 0x00481E2A;
+constexpr uintptr_t kMovieUnlockCall = 0x00481E5E;
+constexpr uintptr_t kLockScreen = 0x004CAEC0;
+constexpr uintptr_t kUnlockScreen = 0x004CAF50;
+
+// The video device's context, and the surface fields in it the copy reads.
+constexpr uintptr_t kVideoContextPtr = 0x00673D20;
+constexpr uintptr_t kVideoSurfaceOffset = 0x50;   // pixels
+constexpr uintptr_t kVideoPitchOffset = 0x54;     // bytes per row
+
+// The HUD. FUN_004ca440 (a __thiscall) draws all of it - score, wanted level,
+// pager, messages, zone names - and it is called once a frame, from here in the
+// frame render FUN_0045a5a0. It lays everything out on a 640-wide canvas scaled
+// by width/640 (the camera's +0xA8, set by FUN_0041eb70), so nothing in it
+// knows about a wider screen. Screen-space draws that are not HUD - money
+// popping up over a pedestrian, text over an object - come from elsewhere
+// (FUN_004b98b0, the object draw FUN_004be060) and must stay where the world is.
+constexpr uintptr_t kHudDrawCall = 0x0045A61F;
+constexpr uintptr_t kHudDraw = 0x004CA440;
+
+// The open Bink movie (width at +0, height at +4) and the BinkCopyToBuffer
+// surface type the frame copy passes. This binkw32.dll's types, decoded off a
+// frame of intro.bik: 0 is 24-bit, 1 is 32-bit B,G,R,X, 2 to 5 are 16-bit.
+constexpr uintptr_t kBinkMoviePtr = 0x00664FF4;
+constexpr uintptr_t kBinkSurfaceType = 0x00664FF8;
+constexpr int32_t kBinkSurface32 = 1;
+
+struct ViewExtent {
+    float minX, maxX, minY, maxY;
+    float Width() const { return maxX - minX; }
+    float Height() const { return maxY - minY; }
+    bool Valid() const { return Width() > 0.01f && Height() > 0.01f; }
+};
+
+// Tile number -> texture, exactly the way the game resolves it
+// (FUN_004bf6b0 then FUN_0046bb50).
+constexpr uintptr_t kStyleObjectPtr = 0x00670684;
+constexpr uintptr_t kTextureArrayPtr = 0x00671978;
+constexpr uintptr_t kStyleTileRemapOffset = 0x40;
+
+inline void* TextureForTile(int tileNumber) {
+    uint8_t* style = *reinterpret_cast<uint8_t**>(kStyleObjectPtr);
+    void** textures = *reinterpret_cast<void***>(kTextureArrayPtr);
+    if (!style || !textures) return nullptr;
+    const uint16_t* remap = *reinterpret_cast<const uint16_t* const*>(style + kStyleTileRemapOffset);
+    if (!remap) return nullptr;
+    const uint16_t id = remap[tileNumber & 0x3FF];
+    return id ? textures[id] : nullptr;
+}
+
+inline uint8_t* CameraStruct() {
+    return *reinterpret_cast<uint8_t**>(kCameraStructPtr);
+}
+
+// Null while the game is in a menu with no world loaded.
+inline uint8_t* MapObject() {
+    uint8_t* holder = *reinterpret_cast<uint8_t**>(kMapHolderPtr);
+    return holder ? *reinterpret_cast<uint8_t**>(holder) : nullptr;
+}
+
+inline HWND MainWindow() {
+    return *reinterpret_cast<HWND*>(kMainWindowPtr);
+}
+
+inline bool VisibleExtent(ViewExtent* out) {
+    const uint8_t* camera = CameraStruct();
+    if (!camera) return false;
+    auto fixed = [camera](uintptr_t offset) {
+        return *reinterpret_cast<const int32_t*>(camera + offset) * kFixedScale;
+    };
+    out->minX = fixed(kViewMinXOffset);
+    out->maxX = fixed(kViewMaxXOffset);
+    out->minY = fixed(kViewMinYOffset);
+    out->maxY = fixed(kViewMaxYOffset);
+    return out->Valid();
+}
+
+// Where GTA2 decides how much of the world is on screen, and the one place its
+// 4:3 assumption lives.
+//
+// FUN_0041E7A0 (sole caller FUN_0041F2F0, the per-frame camera update) builds
+// both rectangles a camera carries, from nothing but the camera's position and
+// zoom - the screen's pixel size is not an input:
+//
+//     half   = (DAT_005E3D18 + cam[0xA0]) * (DAT_005E3D64 / cam[0xA4])
+//              * DAT_005E3F54                              ; 0.5
+//     view.x = cam[0x98] -/+ half        -> cam+0x78, +0x7C   (clamped to the map)
+//     half  *= DAT_005E3F34                                ; 0.75  <- the 4:3
+//     view.y = cam[0x9C] -/+ half        -> cam+0x80, +0x84
+//     seen   = view padded by DAT_005E3D98 (0.75 tiles) -> cam+0x20..+0x2C
+//
+// Every spatial question the population asks goes to one of those two:
+//
+//   - traffic is created where FUN_0045AF40 says `seen` does not reach
+//     (FUN_004B34E0 -> FUN_0045BC90), and recycled by FUN_0045AEA0 on `seen`;
+//   - pedestrians are put on a ring around `view` by FUN_00440CC0 and rejected
+//     by FUN_0040CF60 against `view`;
+//   - FUN_00447390 walks the object grids over `view` to draw them.
+//
+// So a frame wider than 4:3 shows ground the game believes is off screen, and
+// things are created and destroyed there in plain sight. The cure is to make the
+// rectangle the shape of the frame at its source. Both constants are static
+// Fixed objects built at startup (0x004FCD80 and 0x004FD0B0), and DAT_005E3F54
+// has other readers, so neither is written: the operand of each PUSH is
+// repointed at a Fixed the renderer owns. Scaling the first by w and the second
+// by 1/w widens x and leaves y exactly as it was.
+//
+// What this replaced, for the record: a detour of FUN_0045AF40, a widened
+// pedestrian ring, padded grid-walk operands, a per-frame pad written into
+// `seen`, and DAT_005E4CB8 (FUN_0045AEA0's margin). Each moved one consumer
+// without the others, and a spawn point that is further out than the recycler's
+// idea of visible is destroyed before it walks in - the empty streets.
+constexpr uintptr_t kViewHalfScale = 0x005E3F54;
+constexpr uintptr_t kViewAspect = 0x005E3F34;
+// The operand of each PUSH, one past its 0x68 opcode.
+constexpr uintptr_t kViewHalfScaleSite = 0x0041E7F0;
+constexpr uintptr_t kViewAspectSite = 0x0041E8E4;
+// What the game constructs those two as, in 16.14 fixed point.
+constexpr int32_t kViewHalfScaleStock = 0x2000;  // 0.5
+constexpr int32_t kViewAspectStock = 0x3000;     // 0.75
+constexpr float kViewAspectRatioStock = 4.0f / 3.0f;
+
+// Every vertex the game projects gets its **absolute** world position written
+// four slots further along the same array: FUN_0046bbf0 does it for map faces
+// (adding the camera position back in first, which is what makes it absolute),
+// and FUN_004b9990 for sprites. x is east in tiles, y is south in tiles, z is
+// the level. This is the input to the game's projection, not its output, so
+// reading it is not an unprojection.
+constexpr uintptr_t kTileVertexArray = 0x006632A0;
+constexpr uintptr_t kSpriteVertexArray = 0x0066FE18;
+constexpr size_t kVertexStride = 0x20;
+constexpr int kWorldShadowSlots = 4;
+
+// The object draw (FUN_004be060) is the only producer of world sprites; it
+// reaches gbh_DrawQuad from three call sites inside itself. Everything else on
+// that entry point is genuine 2D and belongs in the screen-space pass.
+constexpr uintptr_t kObjectDrawBegin = 0x004BE060;
+constexpr uintptr_t kObjectDrawEnd = 0x004BE600;
+
+inline bool IsObjectDraw(const void* returnAddress) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(returnAddress);
+    return address >= kObjectDrawBegin && address < kObjectDrawEnd;
+}
+
+// The block the world loop is drawing right now, set by FUN_00471f20. Byte 0x0B
+// holds the slope type in its top six bits.
+constexpr uintptr_t kCurrentBlockPtr = 0x00663298;
+
+inline int CurrentBlockSlopeType() {
+    const uint8_t* block = *reinterpret_cast<uint8_t* const*>(kCurrentBlockPtr);
+    return block ? (block[0x0B] >> 2) : 0;
+}
+
+// The cell fractions the partial and corner blocks are cut at (slope types
+// 53-61). The game passes these four as the wall extents in FUN_00471c30:
+// 0x006634B4 is 0, 0x00663450 is a whole cell, and the other two are where the
+// cut falls. Like the slope table they are built at startup, so they only exist
+// in the running process.
+constexpr uintptr_t kCellZeroPtr = 0x006634B4;
+constexpr uintptr_t kCellOnePtr = 0x00663450;
+constexpr uintptr_t kCellLowPtr = 0x006634FC;
+constexpr uintptr_t kCellHighPtr = 0x006635B8;
+
+inline float CellFraction(uintptr_t address) {
+    return *reinterpret_cast<const int32_t*>(address) * kFixedScale;
+}
+
+// Slope descriptors, twelve bytes per slope type: direction at +0, the number
+// of blocks the whole ramp climbs over at +1, and which of them this type is at
+// +2 (gta2.exe!FUN_00471ce0). The table is built at startup rather than stored
+// in the image, so it only exists in the running process.
+constexpr uintptr_t kSlopeTablePtr = 0x00662DB0;
+constexpr size_t kSlopeTableStride = 12;
+
+inline void ReadSlopeTable(uint8_t* directions, uint8_t* steps, uint8_t* stepIndices, int count) {
+    const uint8_t* table = reinterpret_cast<const uint8_t*>(kSlopeTablePtr);
+    for (int type = 0; type < count; ++type) {
+        const uint8_t* entry = table + static_cast<size_t>(type) * kSlopeTableStride;
+        directions[type] = entry[0];
+        steps[type] = entry[1];
+        stepIndices[type] = entry[2];
+    }
+}
+
+// Global view-rotation state. At its default 0xFF the game applies no view
+// rotation, which is the case the mesh builder's tile orientation is written
+// against; any other value also permutes the quad corners.
+constexpr uintptr_t kViewRotationPtr = 0x005930D0;
+
+inline uint8_t ViewRotation() { return *reinterpret_cast<const uint8_t*>(kViewRotationPtr); }
+
+// Set per cell by the game's block draw (FUN_00471f20) just before it calls
+// gbh_DrawTile: the cell's position relative to the camera, in 16.14 fixed
+// point, plus the level currently being drawn.
+constexpr uintptr_t kCellRelXPtr = 0x00663600;
+constexpr uintptr_t kCellRelYPtr = 0x006636F0;
+constexpr uintptr_t kCurrentLevelPtr = 0x006633A0;
+
+// Recovers which cell the game is drawing right now, for cross-checking our own
+// map walk against the game's.
+inline bool CurrentCell(float* cellX, float* cellY, int* level) {
+    const uint8_t* camera = CameraStruct();
+    if (!camera) return false;
+    const float relX = *reinterpret_cast<const int32_t*>(kCellRelXPtr) * kFixedScale;
+    const float relY = *reinterpret_cast<const int32_t*>(kCellRelYPtr) * kFixedScale;
+    *cellX = relX + *reinterpret_cast<const int32_t*>(camera + kCameraXOffset) * kFixedScale;
+    *cellY = relY + *reinterpret_cast<const int32_t*>(camera + kCameraYOffset) * kFixedScale;
+    *level = *reinterpret_cast<const int32_t*>(kCurrentLevelPtr);
+    return true;
+}
+
+// Which tile number a texture record belongs to, by inverting the game's own
+// tile -> texture mapping.
+inline int TileForTexture(const void* record) {
+    if (!record) return -1;
+    for (int tile = 1; tile < 1024; ++tile) {
+        if (TextureForTile(tile) == record) return tile;
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Live effect state, for the lights GTA2 does not emit itself.
+//
+// Particles, objects and vehicles all carry the same placement block, because
+// they all go through FUN_00420600 (position) and FUN_00420690 (heading).
+// ---------------------------------------------------------------------------
+
+// The placement block itself, allocated by FUN_00421000 and written by
+// FUN_00420600 (position) and FUN_00420690 (heading). Entities do not embed it:
+// each holds a *pointer* to one, at an offset that differs per entity type.
+// Reading these straight off the entity - which is what the first attempt did -
+// puts every effect at the corner of the map.
+constexpr uintptr_t kPlaceHeading = 0x00;  // uint16, indexes the trig tables below
+constexpr uintptr_t kPlaceX = 0x14;        // 16.14 fixed, tiles east
+constexpr uintptr_t kPlaceY = 0x18;        // 16.14 fixed, tiles south
+constexpr uintptr_t kPlaceZ = 0x1C;        // 16.14 fixed, map level
+
+// Where each entity keeps that pointer. Both were found by the structure probe
+// in synthetic_lights.cpp rather than read off a decompiler: it snapshots the
+// lists a second apart and looks for the field that is always a map coordinate
+// and moves by a fraction of a tile, which nothing else does.
+constexpr uintptr_t kVehiclePlacementPtr = 0x50;
+constexpr uintptr_t kParticlePlacementPtr = 0x30;
+
+// particle.cpp. The manager (FUN_00491B90 allocates it, 0x947C bytes) is also
+// the pool: free list at +0, live list at +4, walked through +0x3C.
+constexpr uintptr_t kParticleManagerPtr = 0x00669E70;
+constexpr uintptr_t kParticleLiveHead = 0x04;
+constexpr uintptr_t kParticleNext = 0x3C;
+constexpr uintptr_t kParticleLife = 0x2C;  // int16, frames remaining
+constexpr uintptr_t kParticleLifeStart = 0x2E;  // int16, what the life started at
+// How long the blood pool under a body lasts, in frames (FUN_0048CC50).
+constexpr int16_t kBloodPoolLife = 800;
+// Movement per frame along the ground, x then y, 16.14 fixed (FUN_0048C930 stores
+// them; FUN_0048C270 adds them to the position at +0x08 each frame).
+constexpr uintptr_t kParticleVelocity = 0x14;
+constexpr uintptr_t kParticleType = 0x38;  // int32
+
+// The sprite number the particle bank (object type 0x70, code_obj 305-509) starts
+// at, as every particle creator reads it: [[0x00665B40] + 0x8CA4].
+constexpr uintptr_t kObjectBankPtr = 0x00665B40;
+constexpr uintptr_t kParticleSpriteBase = 0x8CA4;
+// The six severed-limb sprites, code_obj 394-399, which no code ever draws.
+constexpr int kGibSpriteOffset = 0x59;
+// The spinning power-up tokens - health, armour, multiplier, the rest - are
+// code_obj 151-254, thirteen of them at eight frames each; the same numbers in
+// all three districts' styles.
+constexpr int kPowerUpSpriteFirst = 151;
+constexpr int kPowerUpSpriteCount = 104;
+constexpr int kGibSprites = 6;
+
+// The blood spray a shot pedestrian gets (FUN_0048C9C0): __thiscall on the
+// effects object at [0x00669E74], then x, y, z in 16.14 and an angle; ret 0x10.
+// Six type-1 particles thrown outward, which FUN_0048C270 carries in an arc.
+constexpr uintptr_t kEffectSystemPtr = 0x00669E74;
+constexpr uintptr_t kBloodSpray = 0x0048C9C0;
+// Sets a sprite object's sprite number (FUN_004206C0): __thiscall, one word.
+constexpr uintptr_t kSetSprite = 0x004206C0;
+
+// The pedestrian death handler, FUN_004411B0, __thiscall on the ped. Every
+// death ends up here. Its first ten bytes are push esi / mov esi, ecx /
+// test byte ptr [esi+0x21F], 1, the same in 9.6 and 11.44.
+constexpr uintptr_t kPedDeathHandler = 0x004411B0;
+constexpr int kPedDeathStolenBytes = 10;
+// What last hurt a pedestrian. The explosion update (FUN_00490D60) sets 4 on
+// every ped it catches. A car with someone at the wheel that hits a ped
+// (FUN_004A0A30) sets 1, or 3 when the car is the thing the ped was in contact
+// with - struck, or driven over - and makes the driver the attacker. 2 is a
+// ped standing on a block that hurts (FUN_0049A560), 5 FUN_004938A0's, 0x12
+// the electro gun.
+constexpr uintptr_t kPedDamageCause = 0x290;
+constexpr int32_t kDamageExplosion = 4;
+constexpr int32_t kDamageCarHit = 1;
+constexpr int32_t kDamageRunOver = 3;
+// Where the ped is, 16.14 fixed - what the death handler hands the blood pool.
+constexpr uintptr_t kPedX = 0x1AC;
+constexpr uintptr_t kPedY = 0x1B0;
+constexpr uintptr_t kPedZ = 0x1B4;
+// The ped's physics object (FUN_004360C0 allocates it from the pool at
+// 0x0066A3B4), whose +0x80 is the sprite object the body is drawn with; the
+// object points back at the ped from +0x7C.
+constexpr uintptr_t kPedPhysics = 0x168;
+constexpr uintptr_t kPhysicsSprite = 0x80;
+// The ped's state, 9 once dead. The death handler sets it through
+// FUN_00433270, which parks it at +0x280 instead while the ped is in state 8 -
+// knocked down, which is what a blast leaves them - so the game's own "is this
+// ped dead" tests read both, and so does anything here.
+constexpr uintptr_t kPedState = 0x278;
+constexpr uintptr_t kPedStatePending = 0x280;
+constexpr int32_t kPedStateDead = 9;
+// State 8 is an interruption with a sub-state at +0x27C, set through
+// FUN_004332B0. The ones that put a ped on the ground:
+//   0x16        punched down (FUN_004436A0, FUN_004454E0); the death handler
+//               checks for it (0x004411F1), since a ped on the ground dies there
+//   0x18..0x1A  hit by a car (FUN_00497570, which also sprays the blood) - and
+//               only these may cut into a knock-down already running
+//   0x1B        dazed, once the damage counter at +0x210 reaches its limit
+//               (FUN_00435CE0, FUN_004454E0)
+// and the ones that do not: 0x13 falling from a height, 0x14 dropping into
+// water (FUN_004938A0), 0x11.
+constexpr uintptr_t kPedSubState = 0x27C;
+constexpr int32_t kPedStateInterrupted = 8;
+inline bool PedSubStateLying(int32_t sub) {
+    return sub == 0x16 || (sub >= 0x18 && sub <= 0x1B);
+}
+// The object draw's first instruction, sub esp, 0xA4, identical in 9.6 and 11.44.
+constexpr int kObjectDrawStolenBytes = 6;
+// The particle manager's allocation (FUN_00491B90), which is also its pool.
+constexpr size_t kParticleManagerBytes = 0x947C;
+
+// Same shape for vehicles: FUN_004254A0 appends, FUN_00425480 prepends.
+constexpr uintptr_t kVehiclePoolPtr = 0x005E4CA0;
+constexpr uintptr_t kVehicleLiveHead = 0x04;
+constexpr uintptr_t kVehicleNext = 0x4C;
+constexpr uintptr_t kVehicleModel = 0x84;   // int32, car model id
+
+// Which of its deltas the car shows, one bit per delta: dents, doors and lamps.
+// FUN_004be060 reads it through the object at +0x08 (lea edi,[ebp+8]) and, with
+// lighting on, draws the lamp bits as a separate lit quad - the masks it uses
+// are at 0x00591E90..98. The car's brake lights are switched on by
+// FUN_004213D0: bit 5 unless the rear corner on that side is dented (bit 1), and
+// bit 22 - the same lamp mirrored to the other side - unless that corner is
+// (bit 0). Delta 5 is a few red pixels at the tail of the sprite.
+constexpr uintptr_t kVehicleDeltaMask = 0x08;
+constexpr uint32_t kBrakeLightDeltaA = 1u << 5;
+constexpr uint32_t kBrakeLightDeltaB = 1u << 22;
+constexpr int kBrakeLightDelta = 5;
+// Headlights the same way, switched on by FUN_00425590: bit 6 unless the front
+// corner on that side is dented (bit 2), bit 23 - its mirror - unless the other
+// is (bit 3). Vehicles FUN_00421700 picks out carry their lamps as deltas 11
+// and 28 instead. The car's own lamp state is at +0xA4 (2 is lights on, the
+// others are flash sequences counted down at +0xA5), and every path that lights
+// the lamps goes through that one function, so the bits are exactly what the
+// game draws - flashing, and a lamp broken by a knock, included.
+constexpr uint32_t kHeadlightDeltaA = 1u << 6;
+constexpr uint32_t kHeadlightDeltaB = 1u << 23;
+constexpr uint32_t kHeadlightAltDeltaA = 1u << 11;
+constexpr uint32_t kHeadlightAltDeltaB = 1u << 28;
+constexpr int kHeadlightDelta = 6;
+constexpr int kHeadlightAltDelta = 11;
+// How FUN_0044AEA0 reads the whole mask when it builds a car's sprite: bit n
+// below 22 is delta n, and bit n from 22 up is delta n - 17 drawn mirrored. So
+// 22 and 23 are 5 and 6 on the other side, 28 is 11. The lamps are the deltas
+// in the masks at 0x00591E90..98 - 5, 6, 15, 16, 17 and 18 - plus the
+// alternative headlight, 11.
+constexpr int kMirroredDeltaFirstBit = 22;
+constexpr int kMirroredDeltaOffset = 17;
+constexpr int kCarLampDeltas[] = {5, 6, 11, 15, 16, 17, 18};
+// With lighting on, FUN_004BE060 draws the car without its lamp deltas and then
+// the lamps alone as a second quad, from the gbh_DrawQuad call at 0x004BE50B.
+// This is where that call returns to.
+constexpr uintptr_t kObjectDrawLampsReturn = 0x004BE511;
+// A car's sprite object leads back to the car: FUN_0040FEB0 returns +0x08 when
+// the object's base (+0x30) is 2.
+constexpr uintptr_t kSpriteObjectOwner = 0x08;
+// Which of the car's delta bits that quad draws. FUN_004BE060 picks one of the
+// masks at 0x00591E90..98 for the car (FUN_004BA350/60/70), leaves it here, takes
+// those bits off the body and draws them, and only them, as the lamp quad - so at
+// the moment that quad arrives this is exactly the set the game is drawing.
+// Brake 5 and headlight 6 on every car, 15-18 on most - lit panels, a roof light
+// with its frames - and 22, 23 the mirrored 5 and 6.
+constexpr uintptr_t kLampMaskPtr = 0x005E85BC;
+// The object the vehicle's placement pointer names is its sprite: the sprite
+// number within its base at +0x22, and the base at +0x30, 2 for cars
+// (FUN_004ba230, FUN_004bf2a0).
+constexpr uintptr_t kSpriteObjectNumber = 0x22;
+constexpr uintptr_t kSpriteObjectBase = 0x30;
+constexpr int32_t kSpriteBaseCar = 2;
+// What particles set with FUN_004206F0(8): the code_obj base.
+constexpr int32_t kSpriteBaseCodeObj = 8;
+// The other one. FUN_004BF2A0, which turns base and number into a style sprite,
+// sends 4 to code_obj as well; objects such as the power-up tokens use it.
+constexpr int32_t kSpriteBaseCodeObjToo = 4;
+// A pedestrian's sprite object has base 3, and its +0x08 is the ped's physics
+// object (FUN_0040FEA0), whose +0x7C is the ped.
+constexpr int32_t kSpriteBasePed = 3;
+constexpr uintptr_t kPhysicsPed = 0x7C;
+// The occupant. Found by the structure probe correlating pointer fields against
+// which cars actually moved: this one is a pointer on 100% of moving cars and on
+// 0% of parked ones, and it points into the entity heap rather than the
+// placement heap - it is a ped sitting in the car. +0x58 behaves the same way
+// and is presumably a passenger.
+constexpr uintptr_t kVehicleDriver = 0x54;
+
+
+// Sine and cosine of a heading, in 16.14 fixed, indexed by the raw heading with
+// no masking - which is how FUN_0040F500 and FUN_0040F520 do it, so any heading
+// the game stores is already in range. Like the slope table these are built at
+// startup, so they read as zeroes in the image and only exist in the process.
+constexpr uintptr_t kSinTablePtr = 0x005D3938;
+constexpr uintptr_t kCosTablePtr = 0x005D6718;
+constexpr int kTrigTableEntries = (kCosTablePtr - kSinTablePtr) / 4;
+// A whole turn in the game's angle units: FUN_00401C10 wraps every angle into
+// 0..0x59F.
+constexpr uint32_t kAngleFullTurn = 0x5A0;
+
+// A linked list read out of another process's heap is one bad pointer away from
+// taking the game down with it, and these lists are walked every frame.
+inline bool PlausiblePointer(const void* p) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(p);
+    return address >= 0x00010000 && address < 0x7FFE0000 && (address & 3) == 0;
+}
+
+inline uint8_t* ParticleListHead() {
+    uint8_t* manager = *reinterpret_cast<uint8_t**>(kParticleManagerPtr);
+    if (!PlausiblePointer(manager)) return nullptr;
+    uint8_t* head = *reinterpret_cast<uint8_t**>(manager + kParticleLiveHead);
+    return PlausiblePointer(head) ? head : nullptr;
+}
+
+inline uint8_t* VehicleListHead() {
+    uint8_t* pool = *reinterpret_cast<uint8_t**>(kVehiclePoolPtr);
+    if (!PlausiblePointer(pool)) return nullptr;
+    uint8_t* head = *reinterpret_cast<uint8_t**>(pool + kVehicleLiveHead);
+    return PlausiblePointer(head) ? head : nullptr;
+}
+
+// Someone in the driving seat, which is what makes a car's headlights its own
+// rather than a parked car's.
+inline bool VehicleHasDriver(const uint8_t* vehicle) {
+    return PlausiblePointer(*reinterpret_cast<const void* const*>(vehicle + kVehicleDriver));
+}
+
+inline uint8_t* NextInList(const uint8_t* entry, uintptr_t nextOffset) {
+    uint8_t* next = *reinterpret_cast<uint8_t* const*>(entry + nextOffset);
+    return PlausiblePointer(next) ? next : nullptr;
+}
+
+inline const uint8_t* Placement(const uint8_t* entity, uintptr_t placementPtrOffset) {
+    const uint8_t* place = *reinterpret_cast<const uint8_t* const*>(entity + placementPtrOffset);
+    return PlausiblePointer(place) ? place : nullptr;
+}
+
+// x east, y south, z the map level - the game's own frame, not the renderer's.
+inline bool ReadPlacement(const uint8_t* entity, uintptr_t placementPtrOffset, float* x, float* y,
+                          float* z) {
+    const uint8_t* place = Placement(entity, placementPtrOffset);
+    if (!place) return false;
+    *x = *reinterpret_cast<const int32_t*>(place + kPlaceX) * kFixedScale;
+    *y = *reinterpret_cast<const int32_t*>(place + kPlaceY) * kFixedScale;
+    *z = *reinterpret_cast<const int32_t*>(place + kPlaceZ) * kFixedScale;
+    return true;
+}
+
+// Forward direction in the game's frame, as the game computes it
+// (FUN_0041FC20: x = sin(heading), y = cos(heading)). False when the trig
+// tables have not been built yet, which is the case in the menus.
+inline bool ReadFacing(const uint8_t* entity, uintptr_t placementPtrOffset, float* dirX,
+                       float* dirY) {
+    const uint8_t* place = Placement(entity, placementPtrOffset);
+    if (!place) return false;
+    const uint16_t heading = *reinterpret_cast<const uint16_t*>(place + kPlaceHeading);
+    if (heading >= kTrigTableEntries) return false;
+    const int32_t s = *reinterpret_cast<const int32_t*>(kSinTablePtr + heading * 4u);
+    const int32_t c = *reinterpret_cast<const int32_t*>(kCosTablePtr + heading * 4u);
+    if (s == 0 && c == 0) return false;   // table not built
+    *dirX = s * kFixedScale;
+    *dirY = c * kFixedScale;
+    return true;
+}
+
+// The car sprite a vehicle is drawn with, as a number within the car base, or
+// -1 when its placement object is not a car sprite.
+inline int VehicleCarSprite(const uint8_t* vehicle) {
+    const uint8_t* place = Placement(vehicle, kVehiclePlacementPtr);
+    if (!place) return -1;
+    if (*reinterpret_cast<const int32_t*>(place + kSpriteObjectBase) != kSpriteBaseCar) return -1;
+    return *reinterpret_cast<const uint16_t*>(place + kSpriteObjectNumber);
+}
+
+inline bool CameraPosition(float* x, float* y) {
+    uint8_t* camera = CameraStruct();
+    if (!camera) return false;
+    *x = *reinterpret_cast<int32_t*>(camera + kCameraXOffset) * kFixedScale;
+    *y = *reinterpret_cast<int32_t*>(camera + kCameraYOffset) * kFixedScale;
+    return true;
+}
+
+}  // namespace game

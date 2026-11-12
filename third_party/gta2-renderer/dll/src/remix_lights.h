@@ -1,0 +1,334 @@
+// Bridges GTA2's own lights into the RTX Remix scene.
+//
+// GTA2 already computes every light in the frame and hands it to the renderer
+// DLL: gbh_ResetLights opens the list, gbh_AddLight adds one, gbh_SetAmbient
+// sets the floor brightness. The descriptors are world space - the same tile
+// coordinates the world mesh is built in - so nothing has to be unprojected.
+// The original D3D renderer used them for per-vertex lighting; here they become
+// real Remix sphere lights instead. See docs/lighting-analysis.md.
+//
+// Remix keeps two collections for API lights: the ones created, keyed by the
+// hash in their info, and a per-frame list of which to actually render. The
+// second is cleared every frame, so a light is in the scene exactly when
+// DrawLightInstance is called for it that frame. That gives the module its
+// shape:
+//
+//   LightsBeginCollect()   gbh_ResetLights - the game is about to list the frame
+//   LightsAddRaw()         gbh_AddLight - one descriptor, decoded and stashed
+//   LightsReconcile()      once per rendered frame: match, create, update, expire
+//   LightsDraw()           DrawLightInstance for everything live, before Present
+//
+// Handle work is kept out of AddRaw deliberately: creating or destroying
+// mid-list would land after the draw pass had already run for that light.
+#pragma once
+
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "time_of_day.h"
+
+namespace gta2dx9 {
+
+// Where a light came from. The game's own lights all arrive through
+// gbh_AddLight; everything above kLightSourceGame is invented by
+// synthetic_lights.cpp from effects GTA2 draws but does not light.
+enum LightSource : uint8_t {
+    kLightSourceGame = 0,
+    kLightSourceMuzzle,
+    kLightSourceBullet,
+    kLightSourceSpark,
+    kLightSourceCigarette,
+    kLightSourceFire,
+    kLightSourceHeadlight,
+    kLightSourceBrake,
+    kLightSourceElectric,
+    kLightSourceCarLamp,
+    kLightSourceFlame,
+    kLightSourceCount
+};
+
+const char* LightSourceName(uint8_t source);
+
+// --- What kind of light the game just handed us ----------------------------
+//
+// GTA2's own lights arrive with no type on them. The LGHT chunk of the .gmp is
+// sixteen bytes of colour, position, radius, intensity and blink timing and
+// nothing else - and byte 13, which the published format docs call a "shape"
+// field, is really the blink jitter (see docs/lighting-analysis.md). So there is
+// no field to read.
+//
+// They are still separable, because what GTA2 puts in those fields is not
+// arbitrary. Across the shipped maps, 12083 lights carry 765 distinct colours
+// and the top ten account for a third of them: #FF8000 and #FF8040 are sodium
+// street lamps, #62CC8C and #00FFFF and #80FFFF are neon, #FFFFFF and #FFDB5E
+// are plain and warm white. And two whole populations do not come from the map
+// at all - traffic lights are built at runtime by FUN_004C3C70 at intensity 200
+// with a colour that cycles red, amber and green, and vehicle lamps are attached
+// to every car by FUN_00424700, also at intensity 200, and move with it.
+//
+// So: movement separates the cars, an exact intensity of 200/255 with a signal
+// colour separates the junctions, and hue separates the rest. It is a heuristic
+// and it is named one, but it is drawn from what is actually in the maps rather
+// than from guesswork, and it is enough to say which lights belong to the night.
+enum GameLightClass : uint8_t {
+    kGameLightStreet = 0,   // sodium and amber, the lamps over the road
+    kGameLightNeon,         // saturated colour: signage, bar fronts
+    kGameLightWhite,        // white and warm white: windows, interiors
+    kGameLightTraffic,      // junction signals, built at runtime
+    kGameLightVehicle,      // headlamps and tail lights, moving with a car
+    kGameLightClassCount
+};
+
+const char* GameLightClassName(uint8_t klass);
+
+struct RemixLightDesc;
+uint8_t ClassifyGameLight(const RemixLightDesc& d, bool moving);
+
+// One light, already converted into renderer world space and 0..1 colour.
+struct RemixLightDesc {
+    float pos[3] = {};      // world units: +X east, +Y up, +Z north
+    float rgb[3] = {};      // 0..1
+    float intensity = 0.0f; // 0..1
+    float radius = 0.0f;    // reach in tiles; drives brightness, not emitter size
+    // The size of the glowing sphere itself, in tiles. 0 is the global emitter
+    // radius; a small lamp wants less, or its sphere reaches into what it sits on.
+    float emitterRadius = 0.0f;
+
+    // Cone shaping, for headlights. dir is a unit vector in world space.
+    bool  spot = false;
+    float dir[3] = {};
+    float coneAngleDeg = 0.0f;
+
+    uint8_t source = kLightSourceGame;
+
+    // When non-zero this light carries its own identity and is matched on it
+    // rather than by position or proximity. Headlights use it so a car's beams
+    // keep one handle for as long as the car exists, however far it drives.
+    uint64_t explicitId = 0;
+};
+
+// A user's per-light edits, persisted to gta2dx9_lights.ini beside the game.
+// Keyed by the light's placement and the district it is in, so an entry keeps
+// pointing at the same lamp across runs.
+struct RemixLightOverride {
+    bool  disabled = false;
+    float intensity = 1.0f;   // multiplier on the game's value
+    float offset[3] = {};
+    bool  recolor = false;
+    float color[3] = {1.0f, 1.0f, 1.0f};
+    float emitterRadius = 0.0f;  // 0 falls back to the global default
+
+    // Free text, so a file full of hashes stays readable.
+    std::string note;
+
+    bool IsDefault() const;
+};
+
+// One light being tracked, as the menu sees it.
+struct RemixTrackedLight {
+    uint64_t id = 0;             // session identity; this is the Remix hash
+    uint64_t key = 0;            // identity that survives a restart, 0 if it moves
+    RemixLightDesc def;
+    void* handle = nullptr;      // remixapi_LightHandle, opaque here
+    bool moving = false;         // has been seen at more than one position
+    uint8_t gameClass = kGameLightStreet;  // meaningless unless source is kLightSourceGame
+    bool drawn = false;          // reached Remix last frame
+    bool dirty = true;           // needs redefining before the next draw
+    bool applyFailed = false;    // CreateLight refused it; stop retrying
+    unsigned updates = 0;
+    uint32_t lastSeenFrame = 0;
+    uint32_t firstFrame = 0;
+};
+
+// What to do with one kind of the game's own lights.
+struct GameLightClassSettings {
+    bool enabled = true;
+    DaylightGate gate;
+};
+
+// Global tuning, all of it exposed in the F4 menu.
+struct RemixLightSettings {
+    RemixLightSettings() {
+        // Everything the city lights itself with follows the sun. The junction
+        // signals do not: a red light has to be legible at noon, and unlike the
+        // lamps it is information rather than illumination.
+        for (int i = 0; i < kGameLightClassCount; ++i) {
+            gameClass[i].gate.enabled = i != kGameLightTraffic;
+        }
+    }
+
+    bool  enabled = true;
+    bool  injectStatic = true;
+    bool  injectMoving = true;   // vehicle headlights, muzzle flashes, train lamps
+
+    // Per kind, on top of those two. GTA2 has no day, so every street lamp and
+    // neon sign in it burns at noon - which nobody noticed while the sky never
+    // changed, and which is the first thing you see once it does. Defaults have
+    // everything but the traffic signals following the sun; a junction signal is
+    // meant to be legible in daylight and stays on. See GameLightClass above and
+    // DaylightGate in time_of_day.h.
+    GameLightClassSettings gameClass[kGameLightClassCount];
+
+    // Radiance = colour * intensity * radianceScale * (radius/reference)^exponent.
+    //
+    // radianceScale is the master brightness and the knob that matters: GTA2
+    // sets 96% of its map lights to intensity 1.0, so the game's own intensity
+    // carries almost no variation. What variation there is lives in the radius
+    // (2, 3 and 4 tiles account for 78% of them) and in the colour, which is
+    // why the reach term below is the one that spreads the lights apart.
+    float radianceScale = 20.0f;
+    float movingScale = 1.0f;    // extra multiplier for lights that move
+    float referenceRadius = 3.0f;  // the modal map light radius, in tiles
+    float radiusExponent = 1.0f;
+
+    // GTA2's palette is far more saturated than anything real - pure #FF8000
+    // sodium, pure #00FFFF neon - and a path tracer bouncing that around a room
+    // exaggerates it further. Pulls each colour towards its own luminance, so
+    // desaturating does not also darken. 1 leaves the game's colours alone.
+    float saturation = 1.0f;
+
+    // Physical size of the emitting sphere in world units (1 unit = 1 map tile).
+    // NOT the game's radius: that is the light's reach, and using it here would
+    // put a glowing ball the width of the street around every lamp.
+    float emitterRadius = 0.15f;
+
+    // The game blinks a light by taking its intensity to zero. Emitting those
+    // would leave a traffic light glowing red, amber and green at once.
+    float minIntensity = 0.004f;
+
+    // GTA2's ambient is an additive floor, which a path tracer has no direct
+    // equivalent for. Optionally stand one up as a dim overhead distant light.
+    bool  ambientFill = false;
+    float ambientFillScale = 1.0f;
+
+    // Softness of the headlight cone edge, 0 is a hard rim.
+    float coneSoftness = 0.35f;
+
+    // How far above the ground a map light buried in it is put, in tiles. The
+    // maps place about half their lamps half a block under the road, which the
+    // original's distance-only lighting never noticed and a path tracer does -
+    // see LiftOutOfGround in remix_lights.cpp. 0 leaves them where the map put
+    // them, dark; 0.5 is the distance they were from the surface, mirrored. A
+    // whole tile spreads them into a softer pool. Capped below anything over
+    // the lamp, so it never ends up inside an overpass.
+    float buriedLift = 1.0f;
+};
+
+void LightsInit(const char* overridePath);
+void LightsShutdown();
+
+RemixLightSettings& LightsSettings();
+
+// --- The game's stream ---
+
+// gbh_ResetLights: the game is about to list this frame's lights.
+void LightsBeginCollect();
+
+// gbh_AddLight: one 20-byte descriptor, exactly as the game built it.
+//   +0x00 u32   byte0 intensity 0..255, byte1 radius (tiles*32), byte2 enable
+//   +0x04 float x   tiles east
+//   +0x08 float y   tiles south
+//   +0x0C float z   tiles up (map level)
+//   +0x10 u32   0x00RRGGBB
+void LightsAddRaw(const void* descriptor);
+
+class GroundSampler;
+// The map's floors, for lifting the game's lights out of the ground they were
+// authored in - see LiftOutOfGround in remix_lights.cpp. Held, not copied; it
+// lives in WorldView for the whole process. Empty until a map is loaded.
+void LightsSetGround(const GroundSampler* ground);
+
+// The current map's own lamps, as its file lists them: x, y, z per lamp in the
+// file's units, 128 to a tile. Only a light standing exactly on one of these is
+// lifted; the lamps the game hangs on every vehicle go through gbh_AddLight
+// as well and are never moved. Called once the map and its floors are in, and
+// redefines every light so each is lifted from the floors it now has.
+void LightsSetMapLights(const std::vector<uint16_t>& xyz);
+
+// gbh_SetAmbient, in the game's own 0..1 scale.
+void LightsSetAmbient(float ambient);
+
+// --- Lights we invent ---
+//
+// Kept in a list of their own rather than appended to the game's, because the
+// game's is discarded when it goes stale (menus, load screens) and these are
+// rebuilt from live state every frame regardless.
+
+// Clears the invented list. Call once per frame before submitting.
+void LightsBeginExtra();
+void LightsSubmitExtra(const RemixLightDesc& desc);
+
+// Which district is loaded. Salts the override keys so two maps cannot share an
+// entry just because a lamp happens to stand in the same place in both.
+void LightsSetScene(const char* name);
+
+// --- Per-frame ---
+
+// Matches this frame's list against the tracked set, then creates, redefines and
+// expires handles. Once per rendered frame, after the game has listed its lights.
+void LightsReconcile();
+
+// DrawLightInstance for every live handle. Must run before Present.
+void LightsDraw();
+
+// --- Menu support ---
+
+const std::vector<RemixTrackedLight>& LightsTracked();
+float LightsAmbient();
+const char* LightsScene();
+
+RemixLightOverride* LightsFindOverride(uint64_t key);
+
+// Returns the entry for editing and marks the file dirty. Only call when
+// something actually changed: merely inspecting a light must not create a row.
+RemixLightOverride& LightsEditOverride(uint64_t key);
+
+void LightsEraseOverride(uint64_t key);
+void LightsClearOverrides();
+void LightsSaveOverrides();
+void LightsLoadOverrides();
+const std::map<uint64_t, RemixLightOverride>& LightsOverrides();
+bool LightsOverridesDirty();
+const char* LightsOverridePath();
+
+// Marks one light for redefining from its current state and overrides, or every
+// light when key is 0. The handle is kept: Remix redefines a light when it is
+// described again under the same hash, so there is no frame in which it is
+// missing.
+void LightsInvalidate(uint64_t key);
+
+// Paints one light magenta so it can be picked out of the scene. Beats a
+// disable, so a light already switched off can still be located. 0 clears.
+void LightsIdentify(uint64_t key);
+uint64_t LightsIdentified();
+
+struct RemixLightStats {
+    int tracked = 0;
+    int drawnLastFrame = 0;
+    int submittedLastFrame = 0;   // what the game listed
+    int moving = 0;
+    int suppressedByOverride = 0;
+    int suppressedByClass = 0;
+    int suppressedByDaylight = 0;  // ...of those, put out by the time of day
+    int suppressedByIntensity = 0;
+    int bySource[kLightSourceCount] = {};   // tracked lights, by where they came from
+    int byClass[kGameLightClassCount] = {}; // the game's own lights, by what kind they are
+    int litByClass[kGameLightClassCount] = {};  // ...and how many of those are actually burning
+    unsigned created = 0;
+    unsigned destroyed = 0;
+    unsigned updated = 0;
+    unsigned applyFailures = 0;
+    int lastApplyError = 0;
+    // What the game is actually asking for right now, so "does GTA2 vary its
+    // light intensity at all?" can be answered by looking rather than guessing.
+    float minIntensitySeen = 0.0f;
+    float maxIntensitySeen = 0.0f;
+    int atFullIntensity = 0;
+    uint32_t collectsSeen = 0;    // how many times the game opened a light list
+    uint32_t framesSinceCollect = 0;
+};
+const RemixLightStats& LightsStats();
+
+}  // namespace gta2dx9

@@ -1,0 +1,420 @@
+{
+  "openxr": {
+    "source": "Unity com.unity.xr.openxr@b5b77b4027be RuntimeLoaders/android/openxr_loader.aar",
+    "apiVersion": "1.1.49",
+    "aarSha256": "06b92ab3c2d583300ace5cc84de7e4e513d5eae790e2d6d3a1226bc82ee4ff83",
+    "files": [
+      {
+        "name": "jni/arm64-v8a/libopenxr_loader.so",
+        "sha256": "12b10b0d6f3a93c52f9aaf8b0d2452771eeff6e6d0852fe0ecc16412c6b9c311"
+      },
+      {
+        "name": "META-INF/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      },
+      {
+        "name": "prefab/modules/headers/include/openxr/openxr.h",
+        "sha256": "c95add5901e57a0ffb38cac8aa8e4dd4b234be43661d819ac55dbc9ca2533170"
+      },
+      {
+        "name": "prefab/modules/headers/include/openxr/openxr_loader_negotiation.h",
+        "sha256": "07af7fb1a156b42ad0aba72b9fbd812b24a8ee2e3fb24e80d4ae31cdcc96b6bb"
+      },
+      {
+        "name": "prefab/modules/headers/include/openxr/openxr_platform.h",
+        "sha256": "1fd138d9db2de2bfc32167695e41823680196c6bc774ce196a91eaea8e76aa48"
+      },
+      {
+        "name": "prefab/modules/headers/include/openxr/openxr_platform_defines.h",
+        "sha256": "59a5369c34013beeea505aa0465768acad558ac016bab3320780e2a653a07bfb"
+      },
+      {
+        "name": "prefab/modules/headers/include/openxr/openxr_reflection.h",
+        "sha256": "ce259b6ba70996f66785f6cda8a9d279a492a8266f9eb6ee64f8bed039b4d331"
+      },
+      {
+        "name": "prefab/modules/headers/include/openxr/openxr_reflection_parent_structs.h",
+        "sha256": "1f2305f91291daa81bcf43118f46a7bbbcb84d1ddad541b025928f1e15195139"
+      },
+      {
+        "name": "prefab/modules/headers/include/openxr/openxr_reflection_structs.h",
+        "sha256": "d679814e2b5be63aa4bb04ec0bea632df319b04acfd5805a449bd64065732fea"
+      }
+    ]
+  },
+  "sdl": {
+    "commit": "98d1f3a45aae568ccd6ed5fec179330f47d4d356",
+    "source": "libsdl-org/SDL",
+    "files": [
+      {
+        "sha256": "9803DAB29FB4522CE3500AB789260E9622DF6307CE90F92AD20C1808E19C4E7B",
+        "name": "begin_code.h"
+      },
+      {
+        "sha256": "4599E9CEDBA7451FF07A6306F0B7531BEED05B1C5A65B1A2613D1B771BE43FDA",
+        "name": "close_code.h"
+      },
+      {
+        "sha256": "97F35B302B361680EC1E891E95D2D52097BB95ABFF361434916D99DC1305F127",
+        "name": "LICENSE.txt"
+      },
+      {
+        "sha256": "DB0D41CAEA4C8DDD56B6938EB4264C20A683D40674E4AD6565F51DAC79B51088",
+        "name": "SDL_assert.h"
+      },
+      {
+        "sha256": "C561CE8F94DE18CCB4F708BDA45880BA6D3C9F052E166BEB5DADC5544F35221E",
+        "name": "SDL_atomic.h"
+      },
+      {
+        "sha256": "047AFC29591AC43A90F06169F67EE7D99A6256C6BBE5EFE5DE79A52565BB6853",
+        "name": "SDL_audio.h"
+      },
+      {
+        "sha256": "63D22D1C8FE0D83BBA5A49ABA9BB700592F14462F7F7BF87E5838064047E3FA9",
+        "name": "SDL_bits.h"
+      },
+      {
+        "sha256": "1985F81B886D9BC681821AF4F23D28E6E51BF51F21E5EF28CCC13BC8C7CDFBAE",
+        "name": "SDL_blendmode.h"
+      },
+      {
+        "sha256": "3E8C73FB9B3CA5A544B70B66B683B78DB53E1A187E066912A068C0ED7BB3E8CE",
+        "name": "SDL_clipboard.h"
+      },
+      {
+        "sha256": "F8671288FF74EC2CF7A61FA4D897E5E24134F3AE7751268C04A64F8506480484",
+        "name": "SDL_config_android.h"
+      },
+      {
+        "sha256": "9296C3E11F6C01D39045BBE4D70C55C1DF91E43D449651AF0D6F1FFDB202716C",
+        "name": "SDL_config_emscripten.h"
+      },
+      {
+        "sha256": "E4E2402FF8B4E6C9175DC099A908EC6D5323E1C39FDBFE2846A0CF1A735D84F1",
+        "name": "SDL_config_iphoneos.h"
+      },
+      {
+        "sha256": "72D7FE03718ACFB37101B1C41F07F5A720E3BF1272C1B0F82F51D9FB807BF98B",
+        "name": "SDL_config_macosx.h"
+      },
+      {
+        "sha256": "F085D153C84913E126F3425F99577D7468BECA8B922FB67FC17CE565CFD2CD7F",
+        "name": "SDL_config_minimal.h"
+      },
+      {
+        "sha256": "DCC3832A97069BCC83AD7DDACE4AB1CA1AFAEFA8D048A3BAD901D908F4131908",
+        "name": "SDL_config_ngage.h"
+      },
+      {
+        "sha256": "D2E6E2840DFB114233986F467E3B8AEA1B786D4A140E8748E4BA7B0D2C278A31",
+        "name": "SDL_config_os2.h"
+      },
+      {
+        "sha256": "759A9794BA650AE3D64D0444B3B587FCC18BC94270F0F2C84FCD228EC003F70B",
+        "name": "SDL_config_pandora.h"
+      },
+      {
+        "sha256": "71B3E9C5E56F0E2F4F70FB65210676BF6A757ADDDC40DDA7181F199AA4BE7B31",
+        "name": "SDL_config_windows.h"
+      },
+      {
+        "sha256": "570A40D525EADACA0A46E1B0FE35E740617B81D73826D4315AC75DB5A8A7FBE5",
+        "name": "SDL_config_wingdk.h"
+      },
+      {
+        "sha256": "3E09BB53551A0EC9650F11903708F1E28059D3383F60327867D317177884E30B",
+        "name": "SDL_config_winrt.h"
+      },
+      {
+        "sha256": "5A84683243E05257CA63FDC3067D3B1B1DDFEDA7077B606D950D7622D3D625A1",
+        "name": "SDL_config_xbox.h"
+      },
+      {
+        "sha256": "58FAE866960DD4B2591EF3B0AE516FCCA7CB6C9DCD9CD16C2C47F767B6C88DD7",
+        "name": "SDL_config.h"
+      },
+      {
+        "sha256": "3F90BE470C18F99F4AEF39444E9374EDBA166CFEB1B90F99F35286CC33924642",
+        "name": "SDL_copying.h"
+      },
+      {
+        "sha256": "FEE0C489ED4364C21FE0B726A47F72DF167FBCBF42CF569807B2BBF77DC30C54",
+        "name": "SDL_cpuinfo.h"
+      },
+      {
+        "sha256": "72C119F4F7EC30F13B03D3E33D2266CB012EE103F0AD1973786D84D538A0B53D",
+        "name": "SDL_egl.h"
+      },
+      {
+        "sha256": "7907CB3AB7B8D7BC99274F5AEF5294BEF215B01EA49D97226CBE6E911DE557D5",
+        "name": "SDL_endian.h"
+      },
+      {
+        "sha256": "0931656A5825E5F1F319F2CD3F573FC527393BB02FA7A1ED3F7FAE6C790328BE",
+        "name": "SDL_error.h"
+      },
+      {
+        "sha256": "CEB7BC717342E652E2C432FD1DD08A5508575CEA6BD8615FB4DDEA63C071DDC4",
+        "name": "SDL_events.h"
+      },
+      {
+        "sha256": "DCFAA010C73150E7B0D56F50F5ADB3FC2E35621091A55BC5436B2FB85FE71675",
+        "name": "SDL_filesystem.h"
+      },
+      {
+        "sha256": "C77C1D8287EE441843B9D8BE87B71252BDB1CE76B7BFC4FCFF46889AD8E9CFEC",
+        "name": "SDL_gamecontroller.h"
+      },
+      {
+        "sha256": "A5A8F8BB8EFB26860FAA9694189AAF76DF1CDB7755CCD30A8599B46B237A5D82",
+        "name": "SDL_gesture.h"
+      },
+      {
+        "sha256": "DA8FEF1D047B31E55D1B167DE301A806481B6948E7C2497779FD71934C45D5DB",
+        "name": "SDL_guid.h"
+      },
+      {
+        "sha256": "4267B6F039BEA7AD0F5CB37C37D63D0704AF84F73A36D2680684FF302F49F153",
+        "name": "SDL_haptic.h"
+      },
+      {
+        "sha256": "489A83D1073E528F82E821C23C515AF8B5A59357EC5AB132C854BB588648F59F",
+        "name": "SDL_hidapi.h"
+      },
+      {
+        "sha256": "96C1056E0734F019B1DAFED5129D4A9D36253559ED8C7577A23C188BB75A48C1",
+        "name": "SDL_hints.h"
+      },
+      {
+        "sha256": "A39FC5DA97EDC94EABFF8616A413CF850EFB35D1DAF437A8CC16CAA837766482",
+        "name": "SDL_joystick.h"
+      },
+      {
+        "sha256": "98B3C717AB10E7C51CAB7B2A4582080C2C50CCAC54C7B7AA69709E7CB2C76AEC",
+        "name": "SDL_keyboard.h"
+      },
+      {
+        "sha256": "291C769A05BC3E1EAD011DB3E07CB52415E1AA306F484904D203E94CBB3186CD",
+        "name": "SDL_keycode.h"
+      },
+      {
+        "sha256": "8D3653B7B774B406A289519C74AE695EB5B52D71060712A88FCE4C72D82B1BD3",
+        "name": "SDL_loadso.h"
+      },
+      {
+        "sha256": "C4A663CE8EA4CA22F961796CAE644A04FC521FA2D0681333F7DA8A581909560C",
+        "name": "SDL_locale.h"
+      },
+      {
+        "sha256": "3342CB31280C2DBF0E5809B03E5499F0CF5EDF193EFA5E3C5B17814526A92033",
+        "name": "SDL_log.h"
+      },
+      {
+        "sha256": "622FFCD0E7FE0C755A987C5EB9DAD6B3672774026B8250B66AD3C40D3A4DDA9A",
+        "name": "SDL_main.h"
+      },
+      {
+        "sha256": "65DF549CAB0A515145AE55325C447159AE1D60171331A7508EAC06034D25C972",
+        "name": "SDL_messagebox.h"
+      },
+      {
+        "sha256": "1F3D0251522B735B0E37677EB1A0594440599FBBB2AF86BBB508606CCA001A06",
+        "name": "SDL_metal.h"
+      },
+      {
+        "sha256": "5D5E4B42481A5EF44EC9D66159E88426BE5632262731A3C3B223277771D30006",
+        "name": "SDL_misc.h"
+      },
+      {
+        "sha256": "66B5353387D011A54B232931E86121CB5551E251B9491B9ED15AFE293D5856FF",
+        "name": "SDL_mouse.h"
+      },
+      {
+        "sha256": "C5EF9A8AEB056422EF878672770E1F60AE965933693DF6D8EBD53D0E514A1794",
+        "name": "SDL_mutex.h"
+      },
+      {
+        "sha256": "FDC6C648734220285056AD8B8273511C75D5BE00D17FC1EA3EB4C06526B13FA3",
+        "name": "SDL_name.h"
+      },
+      {
+        "sha256": "1ABB28891C9B0661B6FF3749DE2671DA5FE12BEB5BCB1833B2D6BDF5C89ECDF8",
+        "name": "SDL_opengl_glext.h"
+      },
+      {
+        "sha256": "C4D2857E757B2B2A83D7531CBEDA19C383AD6D16648AB9B7544FC0A74EB2FF13",
+        "name": "SDL_opengl.h"
+      },
+      {
+        "sha256": "0542791816FCDD84B74D98347AC1B00A97BC6C2CDF31334CD9083789FFB6594A",
+        "name": "SDL_opengles.h"
+      },
+      {
+        "sha256": "D6EC44B1D73F3AFCE3A20AC6976DB7FB3DAC656C5190F0B563E4CE90D79A15AA",
+        "name": "SDL_opengles2_gl2.h"
+      },
+      {
+        "sha256": "4FC5B0034DCDE9C125922E3E70D01489A6B335076856EE660294E1A6305A3719",
+        "name": "SDL_opengles2_gl2ext.h"
+      },
+      {
+        "sha256": "4779BE999ACD1904458238F09C86983B7960AC40E612E05DB2DB97DB615F1E0F",
+        "name": "SDL_opengles2_gl2platform.h"
+      },
+      {
+        "sha256": "7B1E01AAA7AD8F6FC34B5C7BDF79EBF5189BB09E2C4D2E79FC5D350623D11E83",
+        "name": "SDL_opengles2_khrplatform.h"
+      },
+      {
+        "sha256": "73A3B042F7B3D296904BFF91268730D5180638F4EC1836D57258FE53EE60DF8B",
+        "name": "SDL_opengles2.h"
+      },
+      {
+        "sha256": "FEE61AEE337A3823E832F5C26B3000315D6EB95DA91BA20D4FB0B5BAC9D4967A",
+        "name": "SDL_pixels.h"
+      },
+      {
+        "sha256": "9CE62823791D7A16B9AD17AD11F4DE8DCBCDE7918F67BF6D1DD4FC625B69E50C",
+        "name": "SDL_platform.h"
+      },
+      {
+        "sha256": "FBBDF3FF13B21095623EDFC5659C1B76C6DBB1364A4DD14D8F9E5CF329048784",
+        "name": "SDL_power.h"
+      },
+      {
+        "sha256": "9C902ABAEA7560F98FC546BD35A04629A205D047DF5433FC30B0C1D81AF58B21",
+        "name": "SDL_quit.h"
+      },
+      {
+        "sha256": "01DB368D4B7736E2358CD29EEC0D187D964CFD6182CFFAB57A938ADF73B6A418",
+        "name": "SDL_rect.h"
+      },
+      {
+        "sha256": "A0CF0DB1A13D0DD0D8BFDC01FFB371E2B19BE36326F85058200AC9481876C7F0",
+        "name": "SDL_render.h"
+      },
+      {
+        "sha256": "0E7E24C76CDA00D1128CDB800D384EC8F87742E90A64C46F52B21C0E8F2F211E",
+        "name": "SDL_revision.h"
+      },
+      {
+        "sha256": "10DA91C08E96E5FCA452E06E11029908A6F237356E4DB11AF1AD13FFA2E57A47",
+        "name": "SDL_rwops.h"
+      },
+      {
+        "sha256": "EB14F3CEDDE58358F6456D185F473D7551E8234DE260151AD0319861FF1444C2",
+        "name": "SDL_scancode.h"
+      },
+      {
+        "sha256": "F4DABF5BAE217FA6370D8AF73ABDCBBA99AEA626F35E17A381B636AFE01BB81B",
+        "name": "SDL_sensor.h"
+      },
+      {
+        "sha256": "CBDCDD8EAD6D61A7BFA09BC4C538CC598919D1C060D70524C0828D3AF7418667",
+        "name": "SDL_shape.h"
+      },
+      {
+        "sha256": "33EDC0B35512B86162D1AFFE9DF95165B4BC514A90B17238420EFE85D24CA8A1",
+        "name": "SDL_stdinc.h"
+      },
+      {
+        "sha256": "92299233370D645F78D9C655CE7F102C16F9D4DDDE28A59BD82A962C49B51D94",
+        "name": "SDL_surface.h"
+      },
+      {
+        "sha256": "FFC5F3662A85F795C0B2E2B87B9FBF493BCEEDA4AACF7721A68225C5E318CA67",
+        "name": "SDL_system.h"
+      },
+      {
+        "sha256": "34FEC1A5F1089BD395EE11C3A25AD0FC10E7ABC56D4A77CC6F17EB9E4E8A9607",
+        "name": "SDL_syswm.h"
+      },
+      {
+        "sha256": "FE826FEB054929284764718C67AE95B920729AE1336FFEEC88A23D611E6498F0",
+        "name": "SDL_test_assert.h"
+      },
+      {
+        "sha256": "B619CC3020FFDC8F8A12F5D9D4AF8B83E9B7C6C3BFC05C6502933C4B3F0103DE",
+        "name": "SDL_test_common.h"
+      },
+      {
+        "sha256": "713AF284D8520E910D94090396BFD2DB2B2292096EDD93E4D60AA69163B9C510",
+        "name": "SDL_test_compare.h"
+      },
+      {
+        "sha256": "74CB4C2F7F7130D6048A2C716260D6403620F0E358FA928136ED3560BF71A378",
+        "name": "SDL_test_crc32.h"
+      },
+      {
+        "sha256": "B0B7E6AC8BCF7B9E5BF28695B05D3A084CD530C90322CBC9A0B198114B174231",
+        "name": "SDL_test_font.h"
+      },
+      {
+        "sha256": "494E0E49882A9C2745D07DA7B04761D8D992DD90A7A29DD34B605051ED8DCEE5",
+        "name": "SDL_test_fuzzer.h"
+      },
+      {
+        "sha256": "30B9CCB36E07FF0442429A27540F6A796AEE073355B538BD50EF0B98CC47982E",
+        "name": "SDL_test_harness.h"
+      },
+      {
+        "sha256": "35E7AD856A201FBAAFE7EC3FC48DB47FB5D9452C292267F8936AEC5E5C77B81D",
+        "name": "SDL_test_images.h"
+      },
+      {
+        "sha256": "3A8736E6D757666420616F83E7929493FCBE816A0CDDF10347F3446818870BE8",
+        "name": "SDL_test_log.h"
+      },
+      {
+        "sha256": "BE73865B584B5EB207CAB3D8DCFF6AD057286B75053B547B0238DF275E282491",
+        "name": "SDL_test_md5.h"
+      },
+      {
+        "sha256": "556F676637FBB1A85F1998545C59ADDCA358B8B95C71812337B370184F27483F",
+        "name": "SDL_test_memory.h"
+      },
+      {
+        "sha256": "1D8C7987AE39B74D83F40FB54394FD32C61037716C77EBCAF7CE87788934C035",
+        "name": "SDL_test_random.h"
+      },
+      {
+        "sha256": "55E453735FB6A14CF350F663E8C7BC9AA273DB95BB31BCF3ABBFB5B3A91A414E",
+        "name": "SDL_test.h"
+      },
+      {
+        "sha256": "0E546047DD407CA0E1D2D686CF2650AC77A987047184E3645F6BA2EC958DDC5C",
+        "name": "SDL_thread.h"
+      },
+      {
+        "sha256": "D0497AD3D75701613A227134D63FDCBC62ED72F645153D52753E386EE4B498C7",
+        "name": "SDL_timer.h"
+      },
+      {
+        "sha256": "4E5D7A083BBF5237DAF5CCF06FAED3FAE81B1CAA693E27841EBF4EC9BF8FF769",
+        "name": "SDL_touch.h"
+      },
+      {
+        "sha256": "ED0C92BED5EEC2648F744E8451F3AC5140C1EF11510175FA1B726273DBDED9ED",
+        "name": "SDL_types.h"
+      },
+      {
+        "sha256": "E03810C581719F07756A876CB5C32A6CC09113C7EFFB3239B0DFA95037D2F5FE",
+        "name": "SDL_version.h"
+      },
+      {
+        "sha256": "82AB63FF37834CD4BFCEE490B8E37FB892BBB0B31A1A7913EC13C329271CA5FF",
+        "name": "SDL_video.h"
+      },
+      {
+        "sha256": "98ED6B3D354191019AE208FC861799237BA8FFB11FA6BD41B3569E6CE05555B8",
+        "name": "SDL_vulkan.h"
+      },
+      {
+        "sha256": "952E89E1DC4E0DD1A7BEA6A153DF632B8CDB6E433A9B3B0702C5FFE15B9B9360",
+        "name": "SDL.h"
+      }
+    ],
+    "origin": "WinlatorXR pinned gitlink"
+  }
+}

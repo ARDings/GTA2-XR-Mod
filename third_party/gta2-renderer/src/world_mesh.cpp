@@ -1,0 +1,1105 @@
+#include "world_mesh.h"
+
+#include <array>
+#include <cmath>
+#include <utility>
+
+namespace gta2 {
+namespace {
+
+// Tiles are packed edge-to-edge in 256x256 pages, so sampling must stay half a
+// texel inside the tile or neighbours bleed in at the seams.
+constexpr float kUvInset = 0.5f / kTileSize;
+constexpr float kUvMin = kUvInset;
+constexpr float kUvMax = 1.0f - kUvInset;
+
+// Flat faces are decals sitting on a neighbouring block's surface; nudging them
+// along their normal keeps them off the coincident wall plane.
+constexpr float kFlatFaceOffset = 0.002f;
+
+struct Uv {
+    float u, v;
+};
+
+}  // namespace
+
+// --- Lid shape ------------------------------------------------------------
+//
+// Out of the anonymous namespace and declared in the header because the sprite
+// pass samples the same surface it builds here. Two readings of a ramp would be
+// two different floors, and a sprite conformed to the wrong one is exactly the
+// bug the conform exists to remove.
+
+// The heights the game itself uses for a ramp block, taken straight from its
+// slope descriptor (gta2.exe!FUN_00471ce0): the raised edge sits at
+// (steps - step)/steps and the opposite one a single step lower. Deriving
+// "step + 1" instead - the obvious reading - runs every ramp backwards.
+CornerHeights RampHeights(const SlopeInfo& slope) {
+    if (slope.direction < 1 || slope.direction > 4 || slope.steps == 0) {
+        return {1.0f, 1.0f, 1.0f, 1.0f};
+    }
+    const float steps = static_cast<float>(slope.steps);
+    const float high = static_cast<float>(slope.steps - slope.step) / steps;
+    const float low = static_cast<float>(slope.steps - slope.step - 1) / steps;
+    switch (slope.direction) {
+        case 1: return {high, high, low, low};   // rises north
+        case 2: return {low, low, high, high};   // rises south
+        case 3: return {high, low, low, high};   // rises west
+        default: return {low, high, high, low};  // rises east
+    }
+}
+
+// Used only when the game's table has not been read; reproduces the same
+// families it builds at startup: 1-8 climb in two steps, 9-40 in eight,
+// 41-44 in one, in the order north, south, west, east.
+SlopeInfo DeriveSlope(int slopeType) {
+    SlopeInfo slope;
+    if (slopeType >= 1 && slopeType <= 8) {
+        slope.direction = static_cast<uint8_t>((slopeType - 1) / 2 + 1);
+        slope.steps = 2;
+        slope.step = static_cast<uint8_t>((slopeType - 1) % 2);
+    } else if (slopeType >= 9 && slopeType <= 40) {
+        slope.direction = static_cast<uint8_t>((slopeType - 9) / 8 + 1);
+        slope.steps = 8;
+        slope.step = static_cast<uint8_t>((slopeType - 9) % 8);
+    } else if (slopeType >= 41 && slopeType <= 44) {
+        slope.direction = static_cast<uint8_t>(slopeType - 41 + 1);
+        slope.steps = 1;
+        slope.step = 0;
+    }
+    return slope;
+}
+
+CornerHeights LidHeights(const SlopeInfo& slope) { return RampHeights(slope); }
+
+void ResolveSlopeTable(const SlopeInfo* slopes, SlopeInfo* out) {
+    for (int type = 0; type < kSlopeTypeCount; ++type) {
+        const bool usable = slopes && slopes[type].direction >= 1 && slopes[type].direction <= 4 &&
+                            slopes[type].steps != 0 && slopes[type].step < slopes[type].steps;
+        out[type] = usable ? slopes[type] : DeriveSlope(type);
+    }
+}
+
+namespace {
+
+// Orientation tables copied verbatim out of gta2.exe. Each face type has its
+// own: the game indexes them with the face word's bits 13-15 and passes the
+// result to gbh_DrawTile as orientation flags. Walls therefore carry a built-in
+// rotation relative to lids, and use flip bit 0x10 where lids use 0x08 - which
+// is why applying the lid's rules to walls scrambles wall artwork even when the
+// tile itself is correct.
+//
+// Addresses are for the default view-rotation state (0xFF); the other states
+// also permute corner positions and are not handled here.
+constexpr uint8_t kLidFlags[8] = {0x00, 0x08, 0x20, 0x28, 0x40, 0x48, 0x60, 0x68};     // 0x593154
+constexpr uint8_t kLeftFlags[8] = {0x23, 0x33, 0x43, 0x53, 0x63, 0x73, 0x03, 0x13};    // 0x5930D4
+constexpr uint8_t kRightFlags[8] = {0x64, 0x74, 0x04, 0x14, 0x24, 0x34, 0x44, 0x54};   // 0x5930F4
+constexpr uint8_t kTopFlags[8] = {0x41, 0x49, 0x61, 0x69, 0x01, 0x09, 0x21, 0x29};     // 0x593114
+constexpr uint8_t kBottomFlags[8] = {0x02, 0x0A, 0x22, 0x2A, 0x42, 0x4A, 0x62, 0x6A};  // 0x593134
+
+// Diagonal blocks draw their lid as a triangle, and each of the four facings
+// gets its own table (gta2.exe!FUN_0046dfe0, cases 0..3).
+constexpr uint8_t kDiagLidDropNw[8] = {0x65, 0x75, 0x05, 0x15, 0x25, 0x35, 0x45, 0x55};  // 0x5931B4
+constexpr uint8_t kDiagLidDropSe[8] = {0x25, 0x35, 0x45, 0x55, 0x65, 0x75, 0x05, 0x15};  // 0x593194
+constexpr uint8_t kDiagLidDropNeSw[8] = {0x05, 0x0D, 0x25, 0x2D, 0x45, 0x4D, 0x65, 0x6D};  // 0x5931D4
+
+// Maps a fraction of the tile onto the inset range, so a face covering only
+// part of its cell shows only the matching part of the artwork.
+float UvAt(float fraction) { return kUvMin + fraction * (kUvMax - kUvMin); }
+
+// Reproduces gbh_DrawTile's orientation handling exactly: the flags permute the
+// four corners' texture coordinates, and 180 degrees is expressed as "apply both
+// flips" rather than as a rotation. Doing arithmetic on the coordinates instead
+// gives the right artwork in the wrong orientation.
+std::array<Uv, 4> FaceUvs(const Face& face, const uint8_t (&table)[8]) {
+    std::array<Uv, 4> uv = {{{kUvMin, kUvMin}, {kUvMax, kUvMin}, {kUvMax, kUvMax}, {kUvMin, kUvMax}}};
+
+    unsigned flags = table[(face.raw >> 13) & 7];
+    switch (flags & 0x60) {
+        case 0x20: {  // one quarter turn: every corner takes the previous one's UV
+            const Uv last = uv[3];
+            uv[3] = uv[2];
+            uv[2] = uv[1];
+            uv[1] = uv[0];
+            uv[0] = last;
+            break;
+        }
+        case 0x40:  // half turn is expressed as both flips
+            flags ^= 0x18;
+            break;
+        case 0x60: {  // three quarter turns: the same shift in reverse
+            const Uv first = uv[0];
+            uv[0] = uv[1];
+            uv[1] = uv[2];
+            uv[2] = uv[3];
+            uv[3] = first;
+            break;
+        }
+        default:
+            break;
+    }
+    if (flags & 0x8) {
+        std::swap(uv[0], uv[1]);
+        std::swap(uv[2], uv[3]);
+    }
+    if (flags & 0x10) {
+        std::swap(uv[0], uv[3]);
+        std::swap(uv[1], uv[2]);
+    }
+    return uv;
+}
+
+// The part of a face's tile that a face covering only part of its cell shows:
+// a slab a quarter of a cell deep shows a quarter of the tile, not the tile
+// squeezed into a quarter.
+//
+// Which quarter turns with the tile. The game builds the whole cell's mapping
+// onto the whole tile, orientation included (gta2.exe!FUN_0046bea0), and then
+// passes each corner's *position in the cell* through it (FUN_0046c0c0). So the
+// crop is taken in the face's own space, not the texture's: a north slab whose
+// lid is turned half way round shows the bottom rows of its tile. Cropping the
+// texture first and turning only the crop showed the top rows whatever the
+// rotation - and on the lattice over the first save point, whose top rows are
+// all colour key, that left nothing at all.
+//
+// s runs from the face's slot 0 to slot 1, t from slot 0 to slot 3, both as
+// fractions of the whole face; the corners come back in the face's slot order.
+std::array<Uv, 4> FaceUvsPart(const Face& face, const uint8_t (&table)[8], float s0, float s1,
+                              float t0, float t1) {
+    const std::array<Uv, 4> whole = FaceUvs(face, table);
+    const Uv along{whole[1].u - whole[0].u, whole[1].v - whole[0].v};
+    const Uv across{whole[3].u - whole[0].u, whole[3].v - whole[0].v};
+    const float s[4] = {s0, s1, s1, s0};
+    const float t[4] = {t0, t0, t1, t1};
+    std::array<Uv, 4> uv;
+    for (int i = 0; i < 4; ++i) {
+        uv[i] = Uv{whole[0].u + s[i] * along.u + t[i] * across.u,
+                   whole[0].v + s[i] * along.v + t[i] * across.v};
+    }
+    return uv;
+}
+
+struct Vec3 {
+    float x, y, z;
+};
+
+class MeshBuilder {
+public:
+    // Two past the style's own tiles, for the seal and the riverbed - see
+    // SealTileIndex and RiverbedTileIndex.
+    explicit MeshBuilder(const Style& style) : style_(style) {
+        for (int keyed = 0; keyed < 2; ++keyed) {
+            perTile_[keyed].resize(style.TileCount() + 2);
+            perTileTriangle_[keyed].resize(style.TileCount() + 2);
+        }
+    }
+
+    // A quad with no tile behind it, for the black seal under the world. The
+    // corners are given anticlockwise seen from the side the normal points at,
+    // and the winding is worked out the same way AddFaceUv does it.
+    void AddSealQuad(const std::array<Vec3, 4>& corners, Vec3 normal) {
+        // The texture is one flat colour, so the coordinates only have to be
+        // inside it; the corners of the tile keep the mapping obvious.
+        static const std::array<Uv, 4> kUv = {{{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f},
+                                              {0.0f, 1.0f}}};
+        AddPlainQuad(SealTileIndex(style_), corners, normal, kUv);
+    }
+
+    // One cell of riverbed, face up. Its coordinates come from the world, one
+    // repeat per block, so the sand runs on across cells without a seam.
+    void AddRiverbedQuad(const std::array<Vec3, 4>& corners) {
+        std::array<Uv, 4> uv;
+        for (int i = 0; i < 4; ++i) uv[i] = Uv{corners[i].x, corners[i].z};
+        AddPlainQuad(RiverbedTileIndex(style_), corners, {0.0f, 1.0f, 0.0f}, uv);
+    }
+
+    void AddPlainQuad(int slot, const std::array<Vec3, 4>& corners, Vec3 normal,
+                      const std::array<Uv, 4>& uv) {
+        const Vec3 edge1{corners[1].x - corners[0].x, corners[1].y - corners[0].y,
+                         corners[1].z - corners[0].z};
+        const Vec3 edge2{corners[2].x - corners[0].x, corners[2].y - corners[0].y,
+                         corners[2].z - corners[0].z};
+        const Vec3 cross{edge1.y * edge2.z - edge1.z * edge2.y,
+                         edge1.z * edge2.x - edge1.x * edge2.z,
+                         edge1.x * edge2.y - edge1.y * edge2.x};
+        const bool reversed =
+            cross.x * normal.x + cross.y * normal.y + cross.z * normal.z < 0.0f;
+        static const int kForward[4] = {0, 1, 2, 3};
+        static const int kReverse[4] = {0, 3, 2, 1};
+        const int* order = reversed ? kReverse : kForward;
+        std::vector<Vertex>& out = perTile_[0][static_cast<size_t>(slot)];
+        for (int i = 0; i < 4; ++i) {
+            const int corner = order[i];
+            out.push_back(Vertex{corners[corner].x, corners[corner].y, corners[corner].z,
+                                 normal.x, normal.y, normal.z, uv[corner].u, uv[corner].v});
+        }
+    }
+
+    // Corners are given in the original renderer's own vertex-slot order for
+    // that face, since the orientation tables are written against it.
+    //
+    // extraPush moves the quad further along its normal than a flat face's own
+    // nudge, for a tile the game paints onto a plane something else already
+    // occupies.
+    //
+    // panelBack marks the back of a flat panel, which is see-through whatever
+    // its own face word says - see ColourKeyed.
+    void AddFace(const Face& face, const std::array<Vec3, 4>& corners, Vec3 normal,
+                 const uint8_t (&table)[8], float extraPush = 0.0f, bool panelBack = false) {
+        AddFaceUv(face, corners, normal, FaceUvs(face, table), extraPush, panelBack);
+    }
+
+    // Ramps bypass the orientation tables entirely: the game writes texture
+    // coordinates in by hand so a shortened wall shows the *bottom* of its tile
+    // with the top cropped off, rather than the whole tile squashed into a
+    // shorter quad (gta2.exe!FUN_0046c2c0, the DAT_006633b8 = 0x4005 path).
+    void AddFaceUv(const Face& face, const std::array<Vec3, 4>& corners, Vec3 normal,
+                   const std::array<Uv, 4>& uv, float extraPush = 0.0f,
+                   bool panelBack = false) {
+        const int tile = face.Tile();
+        if (tile <= 0 || tile >= static_cast<int>(perTile_[0].size())) return;
+
+        const float push = (face.IsFlat() ? kFlatFaceOffset : 0.0f) + extraPush;
+
+        // Water lids take their coordinates from the world - see
+        // SetWaterUvBlocks. Only lids: a water tile hung on a wall is a
+        // picture of water, and keeps its orientation.
+        std::array<Uv, 4> worldUv;
+        const std::array<Uv, 4>* texcoords = &uv;
+        const float repeat = WaterUvBlocks();
+        if (repeat > 0.0f && normal.y > 0.5f && style_.IsWaterTile(tile)) {
+            for (int i = 0; i < 4; ++i) {
+                worldUv[i] = Uv{corners[i].x / repeat, corners[i].z / repeat};
+            }
+            texcoords = &worldUv;
+        }
+
+        // Slot order differs per face, so winding is derived from the geometry
+        // rather than assumed: if the corners wind away from the outward normal,
+        // the quad is emitted reversed.
+        const Vec3 edge1{corners[1].x - corners[0].x, corners[1].y - corners[0].y,
+                         corners[1].z - corners[0].z};
+        const Vec3 edge2{corners[2].x - corners[0].x, corners[2].y - corners[0].y,
+                         corners[2].z - corners[0].z};
+        const Vec3 cross{edge1.y * edge2.z - edge1.z * edge2.y,
+                         edge1.z * edge2.x - edge1.x * edge2.z,
+                         edge1.x * edge2.y - edge1.y * edge2.x};
+        const float facing = cross.x * normal.x + cross.y * normal.y + cross.z * normal.z;
+        const bool reversed = facing < 0.0f;
+
+        // The normal the vertices carry is the surface's own, measured, rather
+        // than the one the caller named.
+        //
+        // Callers pass the direction the face *points* - which for a wall is
+        // exact, and for a lid is {0,1,0} whether or not that lid is a ramp. A
+        // ramp's four corner heights differ by construction, so its quad is a
+        // sloped plane being described as level. Nothing in the D3D9 pass
+        // noticed, because D3DRS_LIGHTING is off and fixed function never reads
+        // a normal; RTX Remix does read them, so every ramp in the city was
+        // being path traced with the shading of flat ground.
+        //
+        // The cross product above is already the true surface direction, up to
+        // sign, and the caller's normal is exactly the thing that says which
+        // sign is outward. So take the measurement and let the caller orient it.
+        // Walls are unaffected: their cross is parallel to what they pass.
+        Vec3 surface = normal;
+        const float length = std::sqrt(cross.x * cross.x + cross.y * cross.y + cross.z * cross.z);
+        if (length > 1e-6f) {
+            const float sign = reversed ? -1.0f : 1.0f;
+            surface = {cross.x * sign / length, cross.y * sign / length, cross.z * sign / length};
+        }
+
+        std::vector<Vertex>& out = perTile_[ColourKeyed(face, panelBack)][tile];
+        static const int kForward[4] = {0, 1, 2, 3};
+        static const int kReverse[4] = {0, 3, 2, 1};
+        const int* order = reversed ? kReverse : kForward;
+        for (int i = 0; i < 4; ++i) {
+            const int slot = order[i];
+            out.push_back(Vertex{corners[slot].x + surface.x * push,
+                                 corners[slot].y + surface.y * push,
+                                 corners[slot].z + surface.z * push,
+                                 surface.x, surface.y, surface.z,
+                                 (*texcoords)[slot].u, (*texcoords)[slot].v});
+        }
+    }
+
+    // The cut face of a corner ramp is a genuine triangle, not a collapsed quad
+    // (the game draws it through gbh_DrawTriangle, not gbh_DrawTile).
+    void AddTriangle(const Face& face, const std::array<Vec3, 3>& corners,
+                     const std::array<Uv, 3>& uv) {
+        const int tile = face.Tile();
+        if (tile <= 0 || tile >= static_cast<int>(perTile_[0].size())) return;
+
+        const Vec3 edge1{corners[1].x - corners[0].x, corners[1].y - corners[0].y,
+                         corners[1].z - corners[0].z};
+        const Vec3 edge2{corners[2].x - corners[0].x, corners[2].y - corners[0].y,
+                         corners[2].z - corners[0].z};
+        Vec3 normal{edge1.y * edge2.z - edge1.z * edge2.y, edge1.z * edge2.x - edge1.x * edge2.z,
+                    edge1.x * edge2.y - edge1.y * edge2.x};
+        const float length =
+            std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+        if (length < 1e-6f) return;
+        normal = {normal.x / length, normal.y / length, normal.z / length};
+        // It is a ramp surface, so the outward side is the one facing up; that
+        // fixes the winding without having to know the slot order.
+        const bool flip = normal.y < 0.0f;
+        if (flip) normal = {-normal.x, -normal.y, -normal.z};
+
+        static const int kForward[3] = {0, 1, 2};
+        static const int kReverse[3] = {0, 2, 1};
+        const int* order = flip ? kReverse : kForward;
+        // Kept apart from the quads so each can be indexed by its own stride.
+        std::vector<Vertex>& out = perTileTriangle_[ColourKeyed(face, false)][tile];
+        for (int i = 0; i < 3; ++i) {
+            const int slot = order[i];
+            out.push_back(Vertex{corners[slot].x, corners[slot].y, corners[slot].z, normal.x,
+                                 normal.y, normal.z, uv[slot].u, uv[slot].v});
+        }
+    }
+
+    // Opaque batches first, then the see-through ones, so a tile used both ways
+    // is two draws sharing one texture.
+    void Flatten(WorldMesh* out) const {
+        for (int keyed = 0; keyed < 2; ++keyed) {
+            for (size_t tile = 0; tile < perTile_[keyed].size(); ++tile) {
+                FlattenOne(out, static_cast<int>(tile), keyed != 0);
+            }
+        }
+    }
+
+private:
+    // Whether the game lets this quad's colour key through. It does only for a
+    // flat face - each face routine ORs 0x80 into the draw flags when the face
+    // word has 0x1000 (gta2.exe!FUN_0046c2c0 and its siblings, the lid in
+    // FUN_0046dfe0) - and for the back of a flat panel, which the game draws
+    // with 0x1000 forced into the word (FUN_00471d60). Every other face goes
+    // out without 0x80, and the original renderer then uploads the tile with
+    // no colour key at all (d3ddll.dll!FUN_00e02810 keys on 0x380): palette
+    // entry 0 is just a colour there, nearly black in every district.
+    //
+    // So a grille on a flat face is see-through, and the same tile on a solid
+    // wall is not. Keying every face alike opened slits through solid walls,
+    // and closing those by shape closed the grilles too.
+    static int ColourKeyed(const Face& face, bool panelBack) {
+        return (face.IsFlat() || panelBack) ? 1 : 0;
+    }
+
+    void FlattenOne(WorldMesh* out, int tile, bool keyed) const {
+        const std::vector<Vertex>& quads = perTile_[keyed][tile];
+        const std::vector<Vertex>& tris = perTileTriangle_[keyed][tile];
+        if (quads.empty() && tris.empty()) return;
+
+        TileBatch batch;
+        batch.tile = tile;
+        batch.vertexStart = static_cast<uint32_t>(out->vertices.size());
+        batch.vertexCount = static_cast<uint32_t>(quads.size() + tris.size());
+        batch.indexStart = static_cast<uint32_t>(out->indices.size());
+        // The seal has no tile in the style and nothing to cut out of it.
+        batch.needsAlphaTest =
+            keyed && tile < style_.TileCount() && style_.GetTile(tile).hasTransparency;
+        batch.doubleSided = keyed;
+
+        out->vertices.insert(out->vertices.end(), quads.begin(), quads.end());
+        // Corners arrive clockwise seen from outside, which is front-facing
+        // under D3DCULL_CCW once the viewport flips Y.
+        for (uint32_t quad = 0; quad < quads.size(); quad += 4) {
+            const uint32_t base = batch.vertexStart + quad;
+            out->indices.insert(out->indices.end(),
+                                {base + 0, base + 1, base + 2, base + 0, base + 2, base + 3});
+        }
+
+        const uint32_t triStart = batch.vertexStart + static_cast<uint32_t>(quads.size());
+        out->vertices.insert(out->vertices.end(), tris.begin(), tris.end());
+        for (uint32_t tri = 0; tri < tris.size(); tri += 3) {
+            const uint32_t base = triStart + tri;
+            out->indices.insert(out->indices.end(), {base + 0, base + 1, base + 2});
+        }
+
+        batch.indexCount = static_cast<uint32_t>(out->indices.size()) - batch.indexStart;
+        out->batches.push_back(batch);
+    }
+
+    const Style& style_;
+    // Indexed [ColourKeyed][tile].
+    std::vector<std::vector<Vertex>> perTile_[2];
+    std::vector<std::vector<Vertex>> perTileTriangle_[2];
+};
+
+// Texture coordinates for a corner ramp's diagonal cut.
+//
+// A triangle is not oriented the way a quad is. A quad's four corners are
+// permuted through the per-face-type table; gbh_DrawTriangle has only three, so
+// the game hands it a fixed set of coordinates and then rewrites them from the
+// face word's own flip and rotation bits - FUN_0046b710 for the peak shape,
+// FUN_0046b910 for the chamfer. Neither goes near the wall tables.
+//
+// Both were decoded branch by branch and they agree on all eight cases, which
+// are the symmetries of the square indexed by (rotation << 1) | flip:
+//
+//   0 identity        1 mirror u          2 quarter turn    3 transpose
+//   4 half turn       5 mirror v          6 three quarters  7 anti-transpose
+//
+// The game does it by matching the three canonical texel values 0, 32 and
+// 63.9999 and swapping them about, which is the same thing written out for the
+// only coordinates a triangle can have. Doing it as arithmetic keeps it readable
+// and gives the same answer.
+Uv TriangleUv(const Face& face, float u, float v) {
+    if (face.IsFlipped()) u = 1.0f - u;
+    switch (face.Rotation()) {
+        case 1: {  // a quarter turn
+            const float was = u;
+            u = v;
+            v = 1.0f - was;
+            break;
+        }
+        case 2:  // half
+            u = 1.0f - u;
+            v = 1.0f - v;
+            break;
+        case 3: {  // three quarters
+            const float was = u;
+            u = 1.0f - v;
+            v = was;
+            break;
+        }
+        default:
+            break;
+    }
+    return Uv{UvAt(u), UvAt(v)};
+}
+
+// Texture coordinates anywhere on a wall, whatever the tile's orientation.
+//
+// A wall's four corners carry the coordinates the orientation table gave them,
+// and the table is not the identity even for a face word with no flip and no
+// rotation - the left wall's entry 0 is 0x23, a quarter turn. So the coordinates
+// cannot be written out by hand from the geometry: they have to come from the
+// table, and anything wanted at a point *between* the corners has to be
+// interpolated in whatever frame the table left behind.
+//
+// That is what this is. The four corners are re-indexed by what they mean on the
+// wall rather than by slot - along the wall, and up it - and At() reads any
+// point out of that. A ramp then asks for its shortened top edge, and a corner
+// ramp's diagonal cut asks for the midpoint of the top edge, without either of
+// them needing to know which way the artwork ended up facing.
+//
+// This is what the sloped-wall path was missing. It wrote u from the geometry
+// and v from the height, which reproduces the table exactly for a face word of
+// zero - the uOrder tables below were chosen to make it so - and ignores flip
+// and rotation entirely for anything else. Across the shipped districts 12% to
+// 21% of ramp walls carry one, and 4% to 42% of corner-ramp cuts do, which is
+// why the roofs in Downtown were the worst of it.
+struct WallUvFrame {
+    Uv corner[2][2];   // [along the wall 0 or 1][up it 0 or 1]
+
+    Uv At(float along, float up) const {
+        const Uv bottom{corner[0][0].u + (corner[1][0].u - corner[0][0].u) * along,
+                        corner[0][0].v + (corner[1][0].v - corner[0][0].v) * along};
+        const Uv top{corner[0][1].u + (corner[1][1].u - corner[0][1].u) * along,
+                     corner[0][1].v + (corner[1][1].v - corner[0][1].v) * along};
+        return Uv{bottom.u + (top.u - bottom.u) * up, bottom.v + (top.v - bottom.v) * up};
+    }
+};
+
+// topSlots names the two slots carrying the wall's top edge and uOrder which end
+// of the wall each slot sits at, which between them say what every slot means.
+WallUvFrame WallFrame(const Face& face, const uint8_t (&table)[8], const int (&topSlots)[2],
+                      const int (&uOrder)[4]) {
+    const std::array<Uv, 4> uv = FaceUvs(face, table);
+    WallUvFrame frame{};
+    for (int slot = 0; slot < 4; ++slot) {
+        const int up = (slot == topSlots[0] || slot == topSlots[1]) ? 1 : 0;
+        frame.corner[uOrder[slot]][up] = uv[slot];
+    }
+    return frame;
+}
+
+// A wall a ramp has shortened shows the *bottom* of its tile with the top
+// cropped off, rather than the whole tile squashed into a shorter quad
+// (gta2.exe!FUN_0046c2c0, which stores 63.9999 - height * 64 into the vertex's
+// own coordinate and takes the orientation flags from the face word as usual).
+// So each top corner is simply the point `height` of the way up the wall.
+std::array<Uv, 4> SlopedWallUvs(const Face& face, const uint8_t (&table)[8],
+                                const int (&topSlots)[2], const float (&topHeights)[2],
+                                const int (&uOrder)[4]) {
+    const WallUvFrame frame = WallFrame(face, table, topSlots, uOrder);
+    std::array<Uv, 4> uv;
+    for (int slot = 0; slot < 4; ++slot) {
+        float up = 0.0f;
+        if (slot == topSlots[0]) up = topHeights[0];
+        else if (slot == topSlots[1]) up = topHeights[1];
+        uv[slot] = frame.At(static_cast<float>(uOrder[slot]), up);
+    }
+    return uv;
+}
+
+// A flat face is a zero-thickness panel rather than one side of a solid block,
+// so when one of an opposing pair is flat the game puts *both* tiles on that one
+// panel, one facing each way (FUN_00471d60 -> FUN_00470060 and its three
+// siblings, and the same again for partial blocks in FUN_00470be0 and its
+// siblings). Drawing only the flat one leaves the panel blank from behind, which
+// is where the gaps in fences and hoardings came from.
+//
+// The game asks whether the opposite face is there by its whole word, not its
+// tile, so a flat flag with no tile (0x1000) still makes a panel. Maps use
+// exactly that to hang a sign or graffiti on the far edge of an empty block,
+// against the neighbour's wall: the tile is drawn on the far plane and nothing
+// on its own edge.
+bool SoloFace(const Face& face, const Face& opposite) {
+    return static_cast<bool>(face) &&
+           (opposite.raw == 0 || !opposite.IsFlat() || face.IsFlat());
+}
+
+// Whenever the opposite face is flat, its panel also carries this face's tile on
+// its back. With both flat that gives four quads - two panels, each double
+// sided - which is exactly what the game emits.
+bool PanelBack(const Face& face, const Face& opposite) {
+    return static_cast<bool>(face) && opposite.raw != 0 && opposite.IsFlat();
+}
+
+// A panel with no tile of its own is only there to carry this one onto a plane
+// the neighbour's wall (or its flat face) already occupies. The game paints it
+// last; here it is lifted clear of that plane instead.
+float DecalPush(const Face& opposite) { return opposite ? 0.0f : 2.0f * kFlatFaceOffset; }
+
+// A diagonal block is a triangular prism: two of its four side walls stay put,
+// the third spans the cut, and the lid becomes a triangle. Which is which comes
+// straight from the game's dispatch (gta2.exe!FUN_0046edd0), and the lid corner
+// it drops agrees independently with the slot rotation FUN_0046dfe0 applies.
+void AddDiagonalBlock(MeshBuilder* builder, const Block& block, int slopeType, float xWest,
+                      float xEast, float zNorth, float zSouth, float base) {
+    const float top = base + 1.0f;
+    const Vec3 nw{xWest, top, zNorth}, ne{xEast, top, zNorth};
+    const Vec3 se{xEast, top, zSouth}, sw{xWest, top, zSouth};
+    const Vec3 nwB{xWest, base, zNorth}, neB{xEast, base, zNorth};
+    const Vec3 seB{xEast, base, zSouth}, swB{xWest, base, zSouth};
+
+    constexpr float kDiag = 0.70710678f;
+
+    // face  = the block word whose tile the diagonal wall wears
+    // aTop/aBase, bTop/bBase = the two ends of the cut
+    // leftOrder = the cut is drawn with the left wall's slot order, not the right's
+    const Face* face = nullptr;
+    Vec3 aTop{}, aBase{}, bTop{}, bBase{}, normal{};
+    bool leftOrder = true;
+    std::array<Vec3, 4> lid{};
+    const uint8_t (*lidTable)[8] = &kDiagLidDropNw;
+
+    switch (slopeType) {
+        case 45:  // solid to the east and south, cut faces north-west
+            face = &block.left;
+            aTop = ne; aBase = neB; bTop = sw; bBase = swB;
+            normal = {-kDiag, 0.0f, kDiag};
+            leftOrder = true;
+            lid = {ne, se, sw, ne};
+            lidTable = &kDiagLidDropNw;
+            if (block.right) builder->AddFace(block.right, {{ne, neB, seB, se}}, {1.0f, 0.0f, 0.0f}, kRightFlags);
+            if (block.bottom) builder->AddFace(block.bottom, {{sw, se, seB, swB}}, {0.0f, 0.0f, -1.0f}, kBottomFlags);
+            break;
+        case 46:  // solid to the west and south, cut faces north-east
+            face = &block.right;
+            aTop = nw; aBase = nwB; bTop = se; bBase = seB;
+            normal = {kDiag, 0.0f, kDiag};
+            leftOrder = false;
+            lid = {nw, se, se, sw};
+            lidTable = &kDiagLidDropNeSw;
+            if (block.left) builder->AddFace(block.left, {{nwB, nw, sw, swB}}, {-1.0f, 0.0f, 0.0f}, kLeftFlags);
+            if (block.bottom) builder->AddFace(block.bottom, {{sw, se, seB, swB}}, {0.0f, 0.0f, -1.0f}, kBottomFlags);
+            break;
+        case 47:  // solid to the east and north, cut faces south-west
+            face = &block.left;
+            aTop = nw; aBase = nwB; bTop = se; bBase = seB;
+            normal = {-kDiag, 0.0f, -kDiag};
+            leftOrder = true;
+            lid = {nw, ne, se, nw};
+            lidTable = &kDiagLidDropNeSw;
+            if (block.right) builder->AddFace(block.right, {{ne, neB, seB, se}}, {1.0f, 0.0f, 0.0f}, kRightFlags);
+            if (block.top) builder->AddFace(block.top, {{nwB, neB, ne, nw}}, {0.0f, 0.0f, 1.0f}, kTopFlags);
+            break;
+        default:  // 48: solid to the west and north, cut faces south-east
+            face = &block.right;
+            aTop = ne; aBase = neB; bTop = sw; bBase = swB;
+            normal = {kDiag, 0.0f, -kDiag};
+            leftOrder = false;
+            lid = {sw, nw, ne, sw};
+            lidTable = &kDiagLidDropSe;
+            if (block.left) builder->AddFace(block.left, {{nwB, nw, sw, swB}}, {-1.0f, 0.0f, 0.0f}, kLeftFlags);
+            if (block.top) builder->AddFace(block.top, {{nwB, neB, ne, nw}}, {0.0f, 0.0f, 1.0f}, kTopFlags);
+            break;
+    }
+
+    if (face && *face) {
+        const std::array<Vec3, 4> corners =
+            leftOrder ? std::array<Vec3, 4>{{aBase, aTop, bTop, bBase}}
+                      : std::array<Vec3, 4>{{aTop, aBase, bBase, bTop}};
+        builder->AddFace(*face, corners, normal, leftOrder ? kLeftFlags : kRightFlags);
+    }
+    if (block.lid) builder->AddFace(block.lid, lid, {0.0f, 1.0f, 0.0f}, *lidTable);
+}
+
+// Slope types 49-52: corner ramps, reached through the dispatcher FUN_0046ee40.
+//
+// There are *two* shapes per type, chosen by whether the lid tile is 0x3FF, and
+// they are not rotations of one another:
+//
+//   with a lid (0x0046E910 and its siblings) - two walls whole, a triangular
+//     lid over three corners, and the fourth chamfered off by a triangle
+//     running from the diagonal at the top down to that corner's foot;
+//   without one (0x0046E490 and its siblings) - the opposite half of the cell:
+//     a peak at one corner, the diagonal lying on the floor, and the two walls
+//     sloping away from the peak.
+//
+// Type 49 was decoded from the disassembly at 0x0046E910; the lidless shape was
+// confirmed against the world coordinates the running game computed for a type
+// 52 block. Four blocks in five are the lidless one (81 of 99 in `wil`), so
+// building only the lidded shape put nearly every corner piece in upside down.
+void AddCornerRampBlock(MeshBuilder* builder, const Block& block, int slopeType, float xWest,
+                        float xEast, float zNorth, float zSouth, float base) {
+    // Corner order is north-west, north-east, south-east, south-west.
+    const float cornerX[4] = {xWest, xEast, xEast, xWest};
+    const float cornerZ[4] = {zNorth, zNorth, zSouth, zSouth};
+    auto at = [&](int corner, float height) {
+        return Vec3{cornerX[corner], base + height, cornerZ[corner]};
+    };
+
+    // The corner each type is built around, and with it the two walls that stay
+    // solid - always the pair facing away from it. The tile for the cut comes
+    // from the west face for a western corner, the east face for an eastern one.
+    static const int kSpecial[4] = {0, 1, 3, 2};  // types 49, 50, 51, 52
+    const int special = kSpecial[slopeType - 49];
+    const bool westCorner = special == 0 || special == 3;
+    const Face& cutFace = westCorner ? block.left : block.right;
+
+    const bool lidless = block.lid.Tile() == 0x3FF;
+    const int peak = (special + 2) & 3;
+
+    // Corner heights: whole all round for the lidded shape; for the other one
+    // raised at the peak and flat elsewhere, which is what the game expresses by
+    // sending its two walls through the ramp path with a single step.
+    float h[4];
+    for (int corner = 0; corner < 4; ++corner) {
+        h[corner] = lidless ? (corner == peak ? 1.0f : 0.0f) : 1.0f;
+    }
+
+    // A wall a slope has shortened crops its texture rather than squashing it,
+    // exactly as an ordinary ramp does.
+    auto wall = [&](const Face& face, const std::array<Vec3, 4>& corners, Vec3 normal,
+                    const uint8_t (&table)[8], const int (&topSlots)[2], const float (&heights)[2],
+                    const int (&uOrder)[4]) {
+        if (!face) return;
+        if (heights[0] < 1.0f || heights[1] < 1.0f) {
+            builder->AddFaceUv(face, corners, normal,
+                               SlopedWallUvs(face, table, topSlots, heights, uOrder));
+        } else {
+            builder->AddFace(face, corners, normal, table);
+        }
+    };
+
+    const int leftTop[2] = {1, 2};
+    const int leftU[4] = {0, 0, 1, 1};
+    const int rightTop[2] = {0, 3};
+    const int rightU[4] = {1, 1, 0, 0};
+    const int northTop[2] = {2, 3};
+    const int southTop[2] = {0, 1};
+    const int alongX[4] = {0, 1, 1, 0};
+
+    if (westCorner) {  // 49 and 51 keep the east wall
+        const float heights[2] = {h[1], h[2]};
+        wall(block.right, {{at(1, h[1]), at(1, 0.0f), at(2, 0.0f), at(2, h[2])}},
+             {1.0f, 0.0f, 0.0f}, kRightFlags, rightTop, heights, rightU);
+    } else {  // 50 and 52 keep the west wall
+        const float heights[2] = {h[0], h[3]};
+        wall(block.left, {{at(0, 0.0f), at(0, h[0]), at(3, h[3]), at(3, 0.0f)}},
+             {-1.0f, 0.0f, 0.0f}, kLeftFlags, leftTop, heights, leftU);
+    }
+    if (special == 0 || special == 1) {  // 49 and 50 keep the south wall
+        const float heights[2] = {h[3], h[2]};
+        wall(block.bottom, {{at(3, h[3]), at(2, h[2]), at(2, 0.0f), at(3, 0.0f)}},
+             {0.0f, 0.0f, -1.0f}, kBottomFlags, southTop, heights, alongX);
+    } else {  // 51 and 52 keep the north wall
+        const float heights[2] = {h[1], h[0]};
+        wall(block.top, {{at(0, 0.0f), at(1, 0.0f), at(1, h[1]), at(0, h[0])}},
+             {0.0f, 0.0f, 1.0f}, kTopFlags, northTop, heights, alongX);
+    }
+
+    if (cutFace) {
+        // The cut runs diagonally across the cell and the tile runs with it: one
+        // end of the diagonal at each end of the tile, the odd corner at its
+        // middle. 42% of the corner ramps in Downtown carry a flip or a rotation,
+        // which is why its hip roofs had the eaves course running up the hip.
+        if (lidless) {
+            // A peak: one corner at the top, the diagonal lying on the floor.
+            // The game's own coordinates for it are (32,0) (64,64) (0,64).
+            builder->AddTriangle(
+                cutFace, {at(peak, 1.0f), at((peak + 1) & 3, 0.0f), at((peak + 3) & 3, 0.0f)},
+                {TriangleUv(cutFace, 0.5f, 0.0f), TriangleUv(cutFace, 1.0f, 1.0f),
+                 TriangleUv(cutFace, 0.0f, 1.0f)});
+        } else {
+            // A chamfer: the diagonal along the top, dropping to the one corner.
+            builder->AddTriangle(
+                cutFace,
+                {at((special + 1) & 3, 1.0f), at(special, 0.0f), at((special + 3) & 3, 1.0f)},
+                {TriangleUv(cutFace, 0.0f, 0.0f), TriangleUv(cutFace, 0.5f, 1.0f),
+                 TriangleUv(cutFace, 1.0f, 0.0f)});
+        }
+    }
+
+    if (!lidless && block.lid) {
+        // The lid is the ordinary quad with one corner folded onto another,
+        // which is how the game turns it into a triangle (FUN_0046dfe0, the
+        // view-rotation states 0 to 3).
+        static const int kLidSlots[4][4] = {{1, 2, 3, 1},   // 49, drops north-west
+                                            {0, 2, 2, 3},   // 50, drops north-east
+                                            {0, 1, 2, 0},   // 51, drops south-west
+                                            {3, 0, 1, 3}};  // 52, drops south-east
+        const uint8_t(*lidTable)[8] = slopeType == 49   ? &kDiagLidDropNw
+                                      : slopeType == 52 ? &kDiagLidDropSe
+                                                        : &kDiagLidDropNeSw;
+        const int* slots = kLidSlots[slopeType - 49];
+        builder->AddFace(
+            block.lid,
+            {{at(slots[0], 1.0f), at(slots[1], 1.0f), at(slots[2], 1.0f), at(slots[3], 1.0f)}},
+            {0.0f, 1.0f, 0.0f}, *lidTable);
+    }
+}
+
+// Slope types 53-61: a plain box occupying only part of its cell. Which part is
+// decided by two cut fractions the game holds at 0x006634FC and 0x006635B8, and
+// FUN_00471c30 spells the footprints out by passing them as the wall extents -
+// 53 to 56 are slabs against each edge, 57 to 60 are corner posts, 61 is a post
+// in the middle. Each face shows the matching part of its tile rather than the
+// whole of it squeezed down; that the game draws the *unshortened* walls with
+// the ordinary full-tile routine is what confirms the reading.
+void AddPartialBlock(MeshBuilder* builder, const Block& block, int slopeType,
+                     const PartialCuts& cuts, float bx, float zNorth, float base) {
+    const float lo = cuts.low;
+    const float hi = cuts.high;
+    float x0 = 0.0f, x1 = 1.0f, y0 = 0.0f, y1 = 1.0f;
+    switch (slopeType) {
+        case 53: x1 = lo; break;                        // slab against the west edge
+        case 54: x0 = hi; break;                        // east
+        case 55: y1 = lo; break;                        // north
+        case 56: y0 = hi; break;                        // south
+        case 57: x1 = lo; y1 = lo; break;               // north-west post
+        case 58: x0 = hi; y1 = lo; break;               // north-east
+        case 59: x0 = hi; y0 = hi; break;               // south-east
+        case 60: x1 = lo; y0 = hi; break;               // south-west
+        default: x0 = lo; x1 = hi; y0 = lo; y1 = hi; break;  // 61, centred post
+    }
+
+    const float xWest = bx + x0;
+    const float xEast = bx + x1;
+    // Map rows run north to south, so a larger y is further south, which is a
+    // smaller z once the row is mirrored.
+    const float zN = zNorth - y0;
+    const float zS = zNorth - y1;
+    const float top = base + 1.0f;
+
+    if (block.lid) {
+        builder->AddFaceUv(block.lid,
+                           {{{xWest, top, zN}, {xEast, top, zN}, {xEast, top, zS}, {xWest, top, zS}}},
+                           {0.0f, 1.0f, 0.0f},
+                           FaceUvsPart(block.lid, kLidFlags, x0, x1, y0, y1));
+    }
+    // Only the axis a face runs along is cropped; its height is always whole.
+    // The same pairing as a whole block (SoloFace, PanelBack), on the
+    // footprint's own planes.
+    const std::array<Uv, 4> leftUv = FaceUvsPart(block.left, kLeftFlags, 0.0f, 1.0f, y0, y1);
+    const std::array<Uv, 4> rightUv = FaceUvsPart(block.right, kRightFlags, 0.0f, 1.0f, y0, y1);
+    const std::array<Uv, 4> topUv = FaceUvsPart(block.top, kTopFlags, x0, x1, 0.0f, 1.0f);
+    const std::array<Uv, 4> bottomUv = FaceUvsPart(block.bottom, kBottomFlags, x0, x1, 0.0f, 1.0f);
+    if (SoloFace(block.left, block.right)) {
+        builder->AddFaceUv(block.left,
+                           {{{xWest, base, zN}, {xWest, top, zN}, {xWest, top, zS}, {xWest, base, zS}}},
+                           {-1.0f, 0.0f, 0.0f}, leftUv);
+    }
+    if (SoloFace(block.right, block.left)) {
+        builder->AddFaceUv(block.right,
+                           {{{xEast, top, zN}, {xEast, base, zN}, {xEast, base, zS}, {xEast, top, zS}}},
+                           {1.0f, 0.0f, 0.0f}, rightUv);
+    }
+    if (SoloFace(block.top, block.bottom)) {
+        builder->AddFaceUv(block.top,
+                           {{{xWest, base, zN}, {xEast, base, zN}, {xEast, top, zN}, {xWest, top, zN}}},
+                           {0.0f, 0.0f, 1.0f}, topUv);
+    }
+    if (SoloFace(block.bottom, block.top)) {
+        builder->AddFaceUv(block.bottom,
+                           {{{xWest, top, zS}, {xEast, top, zS}, {xEast, base, zS}, {xWest, base, zS}}},
+                           {0.0f, 0.0f, -1.0f}, bottomUv);
+    }
+    // The backs of the panels, in each tile's own slot order - see AddBlock.
+    if (PanelBack(block.right, block.left)) {
+        builder->AddFaceUv(block.right,
+                           {{{xWest, top, zN}, {xWest, base, zN}, {xWest, base, zS}, {xWest, top, zS}}},
+                           {1.0f, 0.0f, 0.0f}, rightUv, DecalPush(block.left), true);
+    }
+    if (PanelBack(block.left, block.right)) {
+        builder->AddFaceUv(block.left,
+                           {{{xEast, base, zN}, {xEast, top, zN}, {xEast, top, zS}, {xEast, base, zS}}},
+                           {-1.0f, 0.0f, 0.0f}, leftUv, DecalPush(block.right), true);
+    }
+    if (PanelBack(block.bottom, block.top)) {
+        builder->AddFaceUv(block.bottom,
+                           {{{xWest, top, zN}, {xEast, top, zN}, {xEast, base, zN}, {xWest, base, zN}}},
+                           {0.0f, 0.0f, -1.0f}, bottomUv, DecalPush(block.top), true);
+    }
+    if (PanelBack(block.top, block.bottom)) {
+        builder->AddFaceUv(block.top,
+                           {{{xWest, base, zS}, {xEast, base, zS}, {xEast, top, zS}, {xWest, top, zS}}},
+                           {0.0f, 0.0f, 1.0f}, topUv, DecalPush(block.bottom), true);
+    }
+}
+
+void AddBlock(MeshBuilder* builder, const Block& block, const SlopeInfo& slope,
+              const PartialCuts& cuts, int bx, int by, int level) {
+    // Map rows run north to south, so the row index is mirrored into +Z-is-north.
+    // Keeping north positive makes the world frame agree with the left-handed
+    // view frame; sharing the sign would mirror the whole city.
+    const float xWest = static_cast<float>(bx);
+    const float xEast = xWest + 1.0f;
+    const float zSouth = static_cast<float>(kMapHeight - by - 1);
+    const float zNorth = zSouth + 1.0f;
+    const float base = static_cast<float>(level);
+
+    const int slopeType = block.SlopeType();
+    if (slopeType >= 45 && slopeType <= 48) {
+        AddDiagonalBlock(builder, block, slopeType, xWest, xEast, zNorth, zSouth, base);
+        return;
+    }
+    if (slopeType >= 49 && slopeType <= 52) {
+        AddCornerRampBlock(builder, block, slopeType, xWest, xEast, zNorth, zSouth, base);
+        return;
+    }
+    if (slopeType >= 53 && slopeType <= 61) {
+        AddPartialBlock(builder, block, slopeType, cuts, xWest, zNorth, base);
+        return;
+    }
+
+    const CornerHeights h = LidHeights(slope);
+    const float yNW = base + h[0];
+    const float yNE = base + h[1];
+    const float ySE = base + h[2];
+    const float ySW = base + h[3];
+    const bool ramp = slope.direction >= 1 && slope.direction <= 4 && slope.steps != 0;
+
+    // Vertex slots below follow the original's own ordering per face, recovered
+    // from which slot each projection call writes.
+    if (block.lid) {
+        builder->AddFace(block.lid,
+                         {{{xWest, yNW, zNorth},    // v0 (x,   y)
+                           {xEast, yNE, zNorth},    // v1 (x+1, y)
+                           {xEast, ySE, zSouth},    // v2 (x+1, y+1)
+                           {xWest, ySW, zSouth}}},  // v3 (x,   y+1)
+                         {0.0f, 1.0f, 0.0f}, kLidFlags);
+    }
+
+    const std::array<Vec3, 4> leftCorners = {{{xWest, base, zNorth},   // v0 bottom (x, y)
+                                              {xWest, yNW, zNorth},    // v1 top    (x, y)
+                                              {xWest, ySW, zSouth},    // v2 top    (x, y+1)
+                                              {xWest, base, zSouth}}}; // v3 bottom (x, y+1)
+    const std::array<Vec3, 4> rightCorners = {{{xEast, yNE, zNorth},    // v0 top    (x+1, y)
+                                               {xEast, base, zNorth},   // v1 bottom (x+1, y)
+                                               {xEast, base, zSouth},   // v2 bottom (x+1, y+1)
+                                               {xEast, ySE, zSouth}}};  // v3 top    (x+1, y+1)
+    const std::array<Vec3, 4> topCorners = {{{xWest, base, zNorth},   // v0 bottom (x,   y)
+                                             {xEast, base, zNorth},   // v1 bottom (x+1, y)
+                                             {xEast, yNE, zNorth},    // v2 top    (x+1, y)
+                                             {xWest, yNW, zNorth}}};  // v3 top    (x,   y)
+    const std::array<Vec3, 4> bottomCorners = {{{xWest, ySW, zSouth},    // v0 top    (x,   y+1)
+                                                {xEast, ySE, zSouth},    // v1 top    (x+1, y+1)
+                                                {xEast, base, zSouth},   // v2 bottom (x+1, y+1)
+                                                {xWest, base, zSouth}}}; // v3 bottom (x, y+1)
+
+    constexpr Vec3 kWest{-1.0f, 0.0f, 0.0f};
+    constexpr Vec3 kEast{1.0f, 0.0f, 0.0f};
+    constexpr Vec3 kNorth{0.0f, 0.0f, 1.0f};
+    constexpr Vec3 kSouth{0.0f, 0.0f, -1.0f};
+
+    // Only a wall that a ramp actually shortened needs hand-written texture
+    // coordinates; every full-height wall keeps the table-driven path, which is
+    // verified against the original renderer.
+    auto addWall = [&](const Face& face, const std::array<Vec3, 4>& corners, Vec3 normal,
+                       const uint8_t (&table)[8], const int (&topSlots)[2],
+                       const float (&topHeights)[2], const int (&uOrder)[4]) {
+        if (ramp && (topHeights[0] < 1.0f || topHeights[1] < 1.0f)) {
+            builder->AddFaceUv(face, corners, normal,
+                               SlopedWallUvs(face, table, topSlots, topHeights, uOrder));
+        } else {
+            builder->AddFace(face, corners, normal, table);
+        }
+    };
+
+    // Slot 1 and 2 hold the left wall's top edge; 0 and 3 the right wall's.
+    const int leftTop[2] = {1, 2};
+    const float leftHeights[2] = {h[0], h[3]};
+    const int leftU[4] = {0, 0, 1, 1};
+    const int rightTop[2] = {0, 3};
+    const float rightHeights[2] = {h[1], h[2]};
+    const int rightU[4] = {1, 1, 0, 0};
+    const int northTop[2] = {2, 3};
+    const float northHeights[2] = {h[1], h[0]};
+    const int northU[4] = {0, 1, 1, 0};
+    const int southTop[2] = {0, 1};
+    const float southHeights[2] = {h[3], h[2]};
+    const int southU[4] = {0, 1, 1, 0};
+
+    if (SoloFace(block.left, block.right)) {
+        addWall(block.left, leftCorners, kWest, kLeftFlags, leftTop, leftHeights, leftU);
+    }
+    if (SoloFace(block.right, block.left)) {
+        addWall(block.right, rightCorners, kEast, kRightFlags, rightTop, rightHeights, rightU);
+    }
+    if (SoloFace(block.top, block.bottom)) {
+        addWall(block.top, topCorners, kNorth, kTopFlags, northTop, northHeights, northU);
+    }
+    if (SoloFace(block.bottom, block.top)) {
+        addWall(block.bottom, bottomCorners, kSouth, kBottomFlags, southTop, southHeights, southU);
+    }
+
+    // The far side of a flat panel: the opposite face's tile, on the panel's own
+    // plane, facing the other way.
+    //
+    // The corners have to be in the slot order belonging to the face whose tile
+    // is being drawn, not the one whose plane it borrows. Each orientation table
+    // is written against its own face's slot order, and left and right number
+    // their corners in opposite directions - left starts at the foot, right at
+    // the top - so handing one the other's ordering turns the artwork upside
+    // down. The game keeps them straight by giving each side its own helper:
+    // FUN_00470060 draws the left tile in left order, FUN_00470250 the right
+    // tile in right order.
+    if (PanelBack(block.right, block.left)) {
+        builder->AddFace(block.right,
+                         {{{xWest, yNW, zNorth},     // v0 top    (x, y)
+                           {xWest, base, zNorth},    // v1 bottom (x, y)
+                           {xWest, base, zSouth},    // v2 bottom (x, y+1)
+                           {xWest, ySW, zSouth}}},   // v3 top    (x, y+1)
+                         kEast, kRightFlags, DecalPush(block.left), true);
+    }
+    if (PanelBack(block.left, block.right)) {
+        builder->AddFace(block.left,
+                         {{{xEast, base, zNorth},    // v0 bottom (x+1, y)
+                           {xEast, yNE, zNorth},     // v1 top    (x+1, y)
+                           {xEast, ySE, zSouth},     // v2 top    (x+1, y+1)
+                           {xEast, base, zSouth}}},  // v3 bottom (x+1, y+1)
+                         kWest, kLeftFlags, DecalPush(block.right), true);
+    }
+    if (PanelBack(block.bottom, block.top)) {
+        builder->AddFace(block.bottom,
+                         {{{xWest, yNW, zNorth},     // v0 top    (x,   y)
+                           {xEast, yNE, zNorth},     // v1 top    (x+1, y)
+                           {xEast, base, zNorth},    // v2 bottom (x+1, y)
+                           {xWest, base, zNorth}}},  // v3 bottom (x,   y)
+                         kSouth, kBottomFlags, DecalPush(block.top), true);
+    }
+    if (PanelBack(block.top, block.bottom)) {
+        builder->AddFace(block.top,
+                         {{{xWest, base, zSouth},    // v0 bottom (x,   y+1)
+                           {xEast, base, zSouth},    // v1 bottom (x+1, y+1)
+                           {xEast, ySE, zSouth},     // v2 top    (x+1, y+1)
+                           {xWest, ySW, zSouth}}},   // v3 top    (x,   y+1)
+                         kNorth, kTopFlags, DecalPush(block.bottom), true);
+    }
+}
+
+}  // namespace
+
+namespace {
+bool g_seal = true;
+float g_waterUvBlocks = kDefaultWaterUvBlocks;
+float g_riverbedDepth = kDefaultRiverbedDepth;
+
+// See SetRiverbedDepth.
+void AddRiverbed(MeshBuilder* builder, const Map& map, const Style& style, float depth) {
+    constexpr float kNone = 1e9f;
+    std::vector<float> bed(static_cast<size_t>(kMapWidth) * kMapHeight, kNone);
+    for (int y = 0; y < kMapHeight; ++y) {
+        for (int x = 0; x < kMapWidth; ++x) {
+            const Column& column = map.ColumnAt(x, y);
+            for (size_t i = 0; i < column.blocks.size(); ++i) {
+                const uint32_t index = column.blocks[i];
+                if (index >= map.BlockCount()) continue;
+                const Block& block = map.BlockAt(index);
+                if (!block.lid || !style.IsWaterTile(block.lid.Tile())) continue;
+                const float floor =
+                    static_cast<float>(column.offset + static_cast<int>(i)) + 1.0f - depth;
+                for (int dy = -kRiverbedPad; dy <= kRiverbedPad; ++dy) {
+                    for (int dx = -kRiverbedPad; dx <= kRiverbedPad; ++dx) {
+                        const int cx = x + dx, cy = y + dy;
+                        if (cx < 0 || cy < 0 || cx >= kMapWidth || cy >= kMapHeight) continue;
+                        float& at = bed[static_cast<size_t>(cy) * kMapWidth + cx];
+                        if (floor < at) at = floor;
+                    }
+                }
+            }
+        }
+    }
+    for (int y = 0; y < kMapHeight; ++y) {
+        for (int x = 0; x < kMapWidth; ++x) {
+            const float h = bed[static_cast<size_t>(y) * kMapWidth + x];
+            if (h >= kNone) continue;
+            // The same mirroring as AddBlock: map row y is the cell from
+            // kMapHeight - y - 1 to kMapHeight - y in Z.
+            const float xWest = static_cast<float>(x);
+            const float zSouth = static_cast<float>(kMapHeight - y - 1);
+            builder->AddRiverbedQuad({{{xWest, h, zSouth + 1.0f},
+                                       {xWest + 1.0f, h, zSouth + 1.0f},
+                                       {xWest + 1.0f, h, zSouth},
+                                       {xWest, h, zSouth}}});
+        }
+    }
+}
+}  // namespace
+
+void SetRiverbedDepth(float blocks) {
+    // Above the seal, which is kSealDepth below level 0 - a sea-level bed any
+    // deeper would sit under it.
+    const float deepest = kSealDepth + 0.9f;
+    g_riverbedDepth = blocks < 0.0f ? 0.0f : (blocks > deepest ? deepest : blocks);
+}
+float RiverbedDepth() { return g_riverbedDepth; }
+
+void SetWorldSeal(bool on) { g_seal = on; }
+bool WorldSeal() { return g_seal; }
+
+void SetWaterUvBlocks(float blocks) {
+    g_waterUvBlocks = blocks < 0.0f ? 0.0f : (blocks > 64.0f ? 64.0f : blocks);
+}
+float WaterUvBlocks() { return g_waterUvBlocks; }
+
+void BuildWorldMesh(const Map& map, const Style& style, const SlopeInfo* slopes,
+                    const PartialCuts& cuts, WorldMesh* out) {
+    // Prefer the game's own slope descriptors; fall back to deriving them when
+    // they could not be read, so a map still builds without a live game.
+    std::array<SlopeInfo, kSlopeTypeCount> resolved;
+    ResolveSlopeTable(slopes, resolved.data());
+
+    MeshBuilder builder(style);
+    for (int y = 0; y < kMapHeight; ++y) {
+        for (int x = 0; x < kMapWidth; ++x) {
+            const Column& column = map.ColumnAt(x, y);
+            for (size_t i = 0; i < column.blocks.size(); ++i) {
+                const uint32_t index = column.blocks[i];
+                if (index >= map.BlockCount()) continue;
+                const Block& block = map.BlockAt(index);
+                AddBlock(&builder, block, resolved[block.SlopeType() & (kSlopeTypeCount - 1)], cuts,
+                         x, y, column.offset + static_cast<int>(i));
+            }
+        }
+    }
+    if (g_riverbedDepth > 0.0f) AddRiverbed(&builder, map, style, g_riverbedDepth);
+    if (g_seal) {
+        // One quad, face up, below everything and reaching well past the map on
+        // every side. Winding is left to AddSealQuad; the normal is what says
+        // which way it faces.
+        const float lo = -kSealOverhang;
+        const float hiX = static_cast<float>(kMapWidth) + kSealOverhang;
+        const float hiZ = static_cast<float>(kMapHeight) + kSealOverhang;
+        const float y = -kSealDepth;
+        builder.AddSealQuad({{{lo, y, lo}, {hiX, y, lo}, {hiX, y, hiZ}, {lo, y, hiZ}}},
+                            {0.0f, 1.0f, 0.0f});
+    }
+    builder.Flatten(out);
+}
+
+}  // namespace gta2

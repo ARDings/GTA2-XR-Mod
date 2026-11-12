@@ -666,16 +666,26 @@ void XrRendererEndFrame(struct XrRenderer* renderer)
     def controller(s):
         anchor = '            }\n        } catch (Exception e) {\n            e.printStackTrace();\n        }\n    }'
         automatic = '''            }
-            // GTA2Ceiling first-run convenience: preserve every explicit assignment/disabled slot.
-            if (enabledSlots[0] && slotAssignments.get(0) == null) {
-                InputDevice xbox = null;
+            // GTA2Ceiling: player 1 gets the connected controller by itself when it
+            // has none - nothing assigned yet, or the assigned one is not connected
+            // (another controller than last time). An Xbox controller first (by
+            // vendor or name, third-party ones included), otherwise the only
+            // controller there is. Several candidates need the user's choice; a
+            // disabled slot stays disabled.
+            if (enabledSlots[0] && getAssignedDeviceForSlot(0) == null) {
+                InputDevice xbox = null, only = null;
+                int xboxes = 0, free = 0;
                 for (InputDevice candidate : detectedDevices) {
-                    if (candidate.getVendorId() != 0x045e || !candidate.getName().toLowerCase(java.util.Locale.ROOT).contains("xbox")) continue;
                     if (getSlotForDevice(candidate.getId()) >= 0) continue;
-                    if (xbox != null) { xbox = null; break; } // Ambiguous controllers need user choice.
-                    xbox = candidate;
+                    String name = candidate.getName() == null ? "" : candidate.getName().toLowerCase(java.util.Locale.ROOT);
+                    ++free; only = candidate;
+                    if (candidate.getVendorId() == 0x045e || name.contains("xbox")) { ++xboxes; xbox = candidate; }
                 }
-                if (xbox != null) assignDeviceToSlot(0, xbox);
+                InputDevice pick = xboxes == 1 ? xbox : (xboxes == 0 && free == 1 ? only : null);
+                if (pick != null) {
+                    android.util.Log.i("GTA2Ceiling", "player 1: " + pick.getName());
+                    assignDeviceToSlot(0, pick);
+                }
             }
         } catch (Exception e) {
             e.printStackTrace();
@@ -685,7 +695,7 @@ void XrRendererEndFrame(struct XrRenderer* renderer)
     edit("app/src/main/java/com/winlator/cmod/inputcontrols/ControllerManager.java", controller)
 
     def touch_pad_loop(s):
-        # GTA2Ceiling: Touch controllers as an Xbox pad when no controller is connected.
+        # GTA2Ceiling: the Touch controllers are always a pad as well.
         return replace_once(s, '                xrAPI.consumeInputs(xServer);\n                if (XrActivity.gamepadEmulation) {',
                             '                xrAPI.consumeInputs(xServer);\n                XrActivity.getInstance().gccUpdateTouchPad();\n'
                             '                if (XrActivity.gamepadEmulation) {')
@@ -698,6 +708,49 @@ void XrRendererEndFrame(struct XrRenderer* renderer)
             raise ValueError("Expected the two WinlatorXR menu-hold checks")
         return s.replace(old, '            if (XrActivity.gccMenuHold(buttons, primaryPress)) {\n')
     edit("app/src/main/java/com/winlator/xr/io/XrController.java", touch_pad_menu)
+
+    def touch_pad_merge(s):
+        # GTA2Ceiling: Touch controllers (virtual pad) and a physical controller
+        # both drive player 1: buttons and d-pad combined, each stick from
+        # whichever pad moves it further, each trigger the stronger.
+        s = replace_once(s, '    /** Virtual gamepad writes directly to P1 buffer, caches last state for gyro-only updates. */\n',
+                         '''    private long gccEnsureAt = 0;
+
+    private GamepadState gccMerged(GamepadState virtual) {
+        if (!XrActivity.isActive() || !XrActivity.gamepadEmulation || virtual == null) return virtual;
+        long now = System.currentTimeMillis();
+        if (currentController == null && now >= gccEnsureAt) { gccEnsureAt = now + 1000; ensureP1Controller(); }
+        if (currentController == null) return virtual;
+        GamepadState physical = currentController.state, merged = new GamepadState();
+        merged.copy(virtual);
+        merged.buttons |= physical.buttons;
+        for (int i = 0; i < 4; i++) merged.dpad[i] |= physical.dpad[i];
+        if (physical.thumbLX * physical.thumbLX + physical.thumbLY * physical.thumbLY >
+                merged.thumbLX * merged.thumbLX + merged.thumbLY * merged.thumbLY) {
+            merged.thumbLX = physical.thumbLX; merged.thumbLY = physical.thumbLY;
+        }
+        if (physical.thumbRX * physical.thumbRX + physical.thumbRY * physical.thumbRY >
+                merged.thumbRX * merged.thumbRX + merged.thumbRY * merged.thumbRY) {
+            merged.thumbRX = physical.thumbRX; merged.thumbRY = physical.thumbRY;
+        }
+        merged.triggerL = Math.max(merged.triggerL, physical.triggerL);
+        merged.triggerR = Math.max(merged.triggerR, physical.triggerR);
+        return merged;
+    }
+
+    /** Virtual gamepad writes directly to P1 buffer, caches last state for gyro-only updates. */
+''')
+        s = replace_once(s, 'writeStateToMappedBuffer(state, gamepadBuffer, true, /*slot*/0);',
+                         'writeStateToMappedBuffer(gccMerged(state), gamepadBuffer, true, /*slot*/0);')
+        s = replace_once(s, '''        if (XrActivity.isActive() && XrActivity.gamepadEmulation && hasVirtualState && lastVirtualState != null) {
+            writeStateToMappedBuffer(lastVirtualState, gamepadBuffer, true, 0);''',
+                         '''        if (XrActivity.isActive() && XrActivity.gamepadEmulation && hasVirtualState && lastVirtualState != null) {
+            writeStateToMappedBuffer(gccMerged(lastVirtualState), gamepadBuffer, true, 0);''')
+        return replace_once(s, '                    GamepadState state = useVirtual ? profile.getGamepadState()\n                            : currentController.state;',
+                            '                    GamepadState state = useVirtual ? profile.getGamepadState()\n'
+                            '                            : (XrActivity.gamepadEmulation && hasVirtualState ? gccMerged(lastVirtualState) : currentController.state);')
+    edit("app/src/main/java/com/winlator/cmod/winhandler/WinHandler.java", touch_pad_merge)
+
     put("app/src/main/java/com/winlator/cmod/core/GccAssets.java", (ROOT / "overlay" / "GccAssets.java").read_text(encoding="utf-8"))
 
     def manifest(s):
@@ -733,7 +786,8 @@ void XrRendererEndFrame(struct XrRenderer* renderer)
             updated = updated.replace(context + '.getResources().getAssets()', 'com.winlator.cmod.core.GccAssets.get(' + context + ')')
             updated = updated.replace(context + '.getAssets()', 'com.winlator.cmod.core.GccAssets.get(' + context + ')')
         updated = updated.replace('getAssets().', 'com.winlator.cmod.core.GccAssets.get(this).')
-        if updated != source or path in changes:
+        # A file patched last time but no longer is goes back to upstream too.
+        if updated != source or path in changes or path in previous:
             put(path, updated, original)
 
     edit("app/build.gradle", lambda s: (ROOT / "overlay" / "app.build.gradle").read_text(encoding="utf-8"))

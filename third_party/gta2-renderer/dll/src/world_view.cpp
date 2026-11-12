@@ -1111,22 +1111,35 @@ void WorldView::UpdateShadowLevels() {
 }
 
 float WorldView::StreetLevel(float tileX, float tileY) {
-    // The most common ground height in a 9x9 tile neighbourhood: the street the
-    // camera is on. A single building column under the camera no longer moves
-    // the whole city (which pushed the streets behind the physical ceiling).
+    // The lowest ground that really is ground around the camera, over the whole
+    // play field: everything below the level chosen here lies behind the real
+    // floor or ceiling and is not drawn. Taking the most common height made a
+    // raised plaza the reference while the player stood on it, and the street
+    // below it then vanished into the room's surface (a dark patch where the
+    // street should be) until the player walked down the stairs. The lowest
+    // level with a real share of the cells (not a single pit or tunnel mouth)
+    // keeps every street of the field above the surface; raised parts simply
+    // stand on it, as buildings do.
     if (map_.Empty()) return -1.0f;
     int histogram[16]{};
     const int cx = static_cast<int>(tileX), cy = static_cast<int>(tileY);
-    for (int y = cy - 4; y <= cy + 4; ++y)
-        for (int x = cx - 4; x <= cx + 4; ++x) {
+    const int radius = (std::clamp)(static_cast<int>(std::ceil(ceiling_.FieldRadiusTiles())), 4, 16);
+    int total = 0;
+    for (int y = cy - radius; y <= cy + radius; ++y)
+        for (int x = cx - radius; x <= cx + radius; ++x) {
             if (x < 0 || y < 0 || x >= gta2::kMapWidth || y >= gta2::kMapHeight) continue;
+            if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > radius * radius) continue;
             const gta2::Column& column = map_.ColumnAt(x, y);
             if (column.blocks.empty()) continue;
             ++histogram[(std::min)(static_cast<int>(column.offset) + 1, 15)];
+            ++total;
         }
+    if (!total) return -1.0f;
+    const int share = (std::max)(3, total / 10);
+    for (int level = 1; level < 16; ++level) if (histogram[level] >= share) return static_cast<float>(level);
     int best = 0;
     for (int level = 1; level < 16; ++level) if (histogram[level] > histogram[best]) best = level;
-    return histogram[best] ? static_cast<float>(best) : -1.0f;
+    return static_cast<float>(best);
 }
 
 void WorldView::UpdateCamera() {
@@ -1368,6 +1381,7 @@ bool WorldView::RenderStereo(bool captureUi) {
     // Returning here would leave the previous stereo city on the host surface
     // indefinitely while the simulation is paused or no new UI is captured.
     ceiling_.SetGraphicsEffective(renderer_.RenderScalePercent(), renderer_.MsaaSamples());
+    SetSpriteDepth(ceiling_.SpriteBodies());
     if (ceiling_.HighEnd() != appliedHighEnd_) {
         appliedHighEnd_ = ceiling_.HighEnd();
         gta2ceiling::SetHighEndTextureFiltering(appliedHighEnd_);

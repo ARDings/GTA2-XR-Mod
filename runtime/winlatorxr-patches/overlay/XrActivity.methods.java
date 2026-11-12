@@ -42,54 +42,24 @@
         }
     }
 
-    // GTA2Ceiling: without a game controller the Quest Touch controllers are the
-    // pad. They become a virtual Xbox pad on P1 (WinlatorXR's gamepad emulation,
-    // same button layout); a connected physical controller always wins. Checked
-    // about once a second from the input thread (XrInput.updateXServer).
+    // GTA2Ceiling: the Quest Touch controllers are always a pad as well, in the
+    // Xbox layout (WinlatorXR's gamepad emulation); a connected Xbox controller
+    // works at the same time - WinHandler merges both into player 1. Mapped keys
+    // and mouse emulation stay off so nothing is pressed twice. Called from the
+    // input thread (XrInput.updateXServer); only the first call does anything.
     private Boolean gccMode = null;
-    private Boolean gccTouchPad = null;
-    private boolean gccSavedKeys = true, gccSavedMouse = true;
-    private long gccPadCheckAt = 0;
+    private boolean gccTouchPadOn = false;
 
     public boolean gccMode() {
         if (gccMode == null) gccMode = SessionSettings.getBoolean(this, "gcc_exact_colour_key", false);
         return gccMode;
     }
 
-    // A real game controller (Bluetooth or USB), never the Quest's own controllers.
-    private static String gccPhysicalPad() {
-        for (int id : android.view.InputDevice.getDeviceIds()) {
-            android.view.InputDevice device = android.view.InputDevice.getDevice(id);
-            if (device == null || device.isVirtual()) continue;
-            int sources = device.getSources();
-            if ((sources & android.view.InputDevice.SOURCE_GAMEPAD) != android.view.InputDevice.SOURCE_GAMEPAD) continue;
-            String name = device.getName() == null ? "" : device.getName();
-            String lower = name.toLowerCase(java.util.Locale.ROOT);
-            if (lower.contains("oculus") || lower.contains("meta") || lower.contains("quest") || lower.contains("touch")
-                    || lower.contains("virtual") || lower.contains("uinput")) continue;
-            return name.isEmpty() ? "controller " + id : name;
-        }
-        return null;
-    }
-
     public void gccUpdateTouchPad() {
-        long now = System.currentTimeMillis();
-        if (now < gccPadCheckAt || !gccMode()) return;
-        gccPadCheckAt = now + 1000;
-        String physical = gccPhysicalPad();
-        boolean touch = physical == null;
-        if (gccTouchPad != null && gccTouchPad == touch) return;
-        if (gccTouchPad == null) { gccSavedKeys = keysEmulation; gccSavedMouse = mouseEmulation; }
-        gccTouchPad = touch;
-        if (touch) {
-            // Only the pad: mapped keys or a mouse on top would press things twice.
-            gamepadEmulation = true; keysEmulation = false; mouseEmulation = false;
-            android.util.Log.i("GTA2Ceiling", "no game controller: the Touch controllers act as an Xbox pad");
-        } else {
-            if (gamepadEmulation) getWinHandler().sendVirtualGamepadState(new com.winlator.cmod.inputcontrols.GamepadState());
-            gamepadEmulation = false; keysEmulation = gccSavedKeys; mouseEmulation = gccSavedMouse;
-            android.util.Log.i("GTA2Ceiling", "game controller connected (" + physical + "): Touch pad off");
-        }
+        if (gccTouchPadOn || !gccMode()) return;
+        gccTouchPadOn = true;
+        gamepadEmulation = true; keysEmulation = false; mouseEmulation = false;
+        android.util.Log.i("GTA2Ceiling", "Touch controllers and game controller both drive player 1");
     }
 
     // GTA2Ceiling: the right stick press belongs to the game (held 4 s it freezes

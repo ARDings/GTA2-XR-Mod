@@ -186,10 +186,9 @@ private:
 
     float smoothedHeight_ = 0.0f;
     bool heightSettled_ = false;
-    // GTA2Ceiling: the street level is pinned to the map's most common ground
-    // height. Following the ground under the camera shifted the whole city up
-    // whenever the camera crossed a building column, which pushed the streets
-    // behind the physical ceiling plane and made their texture vanish.
+    // GTA2Ceiling: the street level is the lowest ground with a real share of
+    // the play field around the camera (see the .cpp). Anything below it would
+    // lie behind the physical floor or ceiling and vanish.
     float StreetLevel(float tileX, float tileY);
     // Ground levels that receive building shadows (refreshed per city tile).
     static constexpr int kMaxShadowLevels = 1;  // the street level only (GPU)

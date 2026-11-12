@@ -232,10 +232,12 @@ bool ReadSpriteDepthSetting() {
     std::strcpy(slash + 1, "gta2ceiling.ini");
     return GetPrivateProfileIntA("sprites", "depth", 1, path) != 0;
 }
+int g_spriteDepthOverride = -1;  // -1: gta2ceiling.ini decides; else the menu (LT)
 bool SpriteDepthOn() {
-    static const bool on = ReadSpriteDepthSetting();
-    return on;
+    static const bool fromIni = ReadSpriteDepthSetting();
+    return g_spriteDepthOverride < 0 ? fromIni : g_spriteDepthOverride != 0;
 }
+void SetSpriteDepth(bool on) { g_spriteDepthOverride = on ? 1 : 0; }
 void ReleaseLampTextures();
 // Per lamp delta, one entry per car sprite.
 std::map<int, std::vector<LampArt>> g_lampArt;

@@ -18,12 +18,11 @@ The rest of the room stays visible through passthrough. You lean back, look up, 
 - **Fixed, sharp image** – the scene renders 1:1 at the window size with anisotropic filtering, shown 1:1 in the host eye buffers (no MSAA and no shadows: the GPU budget goes to a steady frame rate); occlusion can be toggled in the headset.
 - **Clean passthrough edge** – the city is cut out against the room with an exact colour key and its own alpha coverage, so there are no pink fringes.
 - **Walk out of the game** – freeze the city on a round field and drive or walk off its edge onto your real floor, then back in anywhere.
-- **Optional holo cut** – buildings cut open by the edge of the round field are closed with a holographic surface.
-- **Controller-first** – Xbox controller (or the Quest Touch controllers in the same layout) with GTA2's original controls or an optional modern scheme (stick direction on foot, triggers in a car); a hidden in-headset menu for placement and options.
+- **Controller-first** – Xbox controller (or the Quest Touch controllers in the same layout) with modern controls by default (stick direction on foot, triggers in a car) or GTA2's original ones; a hidden in-headset menu for placement and options.
 
 ### In-headset menu
 
-Press **both sticks** briefly to open it (hold them for 1 s to put your character directly above/below you).
+Press **both sticks** briefly to open it.
 
 In the circle, **hold the right stick for 4 s** to freeze the city in place while the game goes on. Walk or drive off the edge and your character (or your car) leaves the disc onto your real floor at full speed, with the game's own controls and physics: only the player is shown outside, and outside the disc there are no walls or streets to run into, because while the city is frozen the game's map out there is flat ground (in memory only, put back exactly as it was afterwards). Drive around the outside and back into the disc anywhere: the map shows the same section the whole time and the game simply goes on at the spot where you come back in. Hold the right stick again for 4 s to let the city follow the player again; nothing jumps, the city glides back under the player within a second and a half.
 
@@ -35,14 +34,14 @@ In the circle, **hold the right stick for 4 s** to freeze the city in place whil
 | D-pad left/right | Whole surface / circle |
 | D-pad up/down | Circle size (0.5 to 3 m) |
 | Y | View range: how far from the player cars and people appear (1x to 3x) |
-| RT | Controls: classic (GTA2's own: left/right turn, up walks) or modern (see below) |
-| X | Holo cut (round field): buildings cut open by the edge of the field are closed with a holographic surface on the cut, so you cannot look inside (off by default) |
+| LT | Sprite bodies: cars and people as small stacked bodies, or flat as in the original |
+| RT | Controls: modern (default, see below) or classic (GTA2's own: left/right turn, up walks) |
 | Start | Real-world occlusion |
 | A / B | Save / discard |
 
 ### Quest Touch controllers
 
-No Xbox controller? When none is connected, the GTA2Ceiling host turns the two Touch controllers into an Xbox pad with the same layout, so everything above works the same. Connect an Xbox controller and it takes over at once.
+No Xbox controller? The GTA2Ceiling host always turns the two Touch controllers into an Xbox pad with the same layout, so everything above works the same. An Xbox controller works at the same time: both drive the same player, switch between them whenever you like.
 
 | Xbox | Touch |
 |---|---|
@@ -54,11 +53,11 @@ No Xbox controller? When none is connected, the GTA2Ceiling host turns the two T
 | Back | ≡ button, held |
 | D-pad | Hold both grips, then the left stick |
 
-The WinlatorXR system menu opens when you hold the **left** thumbstick alone for a second (the right one belongs to the game).
+The WinlatorXR system menu opens when you hold the **left** thumbstick alone for a second (the right one belongs to the game). The first Xbox controller that is connected becomes player 1 by itself, also when it replaces a different one.
 
-### Modern controls (optional)
+### Modern controls (default)
 
-GTA2 steers like a tank: left/right turn the character, up walks where it faces. With **RT** in the menu you can switch to a modern scheme. Nothing in the game is changed; the mod only holds different keys for you.
+GTA2 steers like a tank: left/right turn the character, up walks where it faces. GTA2Ceiling starts with a modern scheme instead; **RT** in the menu switches back to the classic one. Nothing in the game is changed; the mod only holds different keys for you.
 
 - **On foot:** the left stick points where the character should go, as you see the city from where you stand. It turns that way by itself and walks.
 - **In a car:** RT accelerates, LT brakes and reverses, the left stick steers, B fires. A still gets in and out.

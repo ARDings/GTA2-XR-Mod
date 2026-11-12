@@ -47,6 +47,7 @@ void CeilingBridge::Configure() {
     // (display-rate reprojection), so by default the game renders exactly
     // once per simulation frame: one steady rate, all CPU/GPU for the game.
     poseRefresh_=GetPrivateProfileIntA("xr","pose_refresh",0,path)!=0;
+    spriteBodies_=GetPrivateProfileIntA("sprites","depth",1,path)!=0;
     if (leaf) {
         const std::string directory(path,static_cast<size_t>(leaf-path));
         placementFile_=std::make_unique<PlacementFileStore>(directory);
@@ -62,8 +63,9 @@ void CeilingBridge::Configure() {
         GetPrivateProfileStringA("ceiling","shape","room",shape,sizeof(shape),userGraphicsPath_.c_str());
         viewRange_=std::clamp(GetPrivateProfileIntA("graphics","view_range_percent",100,
                                                     userGraphicsPath_.c_str())/100.0f,1.0f,3.0f);
-        holoCuts_=GetPrivateProfileIntA("graphics","holo_cuts",0,userGraphicsPath_.c_str())!=0;
-        modernControls_=GetPrivateProfileIntA("controller","modern",0,userGraphicsPath_.c_str())!=0;
+        holoCuts_=false;  // the holo cut is switched off for now (no menu entry)
+        modernControls_=GetPrivateProfileIntA("controller","modern",1,userGraphicsPath_.c_str())!=0;  // modern by default
+        spriteBodies_=GetPrivateProfileIntA("sprites","depth",spriteBodies_?1:0,userGraphicsPath_.c_str())!=0;
         circleSize_=std::clamp(GetPrivateProfileIntA("ceiling","circle_diameter_millimeters",1000,
                                                      userGraphicsPath_.c_str())/1000.0f,0.5f,3.0f);
         // The former table mode is gone; a saved "table" becomes the circle.
@@ -457,14 +459,6 @@ bool CeilingBridge::ConsumeController(const GamepadState& state) {
         gta2dx9::Log("view range: %.1fx",viewRange_);
         guideRefreshMs_=0;
     }
-    if (wasPlacing && placement_->Active() && (pressed&0x4000)) {
-        // X: holographic insides for buildings cut open by the field's edge.
-        holoCuts_=!holoCuts_;
-        if (!userGraphicsPath_.empty())
-            WritePrivateProfileStringA("graphics","holo_cuts",holoCuts_?"1":"0",userGraphicsPath_.c_str());
-        gta2dx9::Log("holo cut edges: %s",holoCuts_?"on":"off");
-        guideRefreshMs_=0;
-    }
     if (wasPlacing && placement_->Active() && shape_==Shape::Circle && (pressed&(0x0001|0x0002))) {
         // D-pad up/down: circle size, 0.5 to 3 m in 25 cm steps.
         circleSize_=std::clamp(circleSize_+((pressed&0x0001)?0.25f:-0.25f),0.5f,3.0f);
@@ -504,6 +498,14 @@ bool CeilingBridge::ConsumeController(const GamepadState& state) {
     const bool leftTrigger=state.available && state.left_trigger>128;
     const bool leftTriggerPressed=leftTrigger && !previousLeftTrigger_;
     previousLeftTrigger_=leftTrigger;
+    if (leftTriggerPressed && wasPlacing && placement_->Active()) {
+        // LT: stacked sprite bodies for cars and people, or flat sprites.
+        spriteBodies_=!spriteBodies_;
+        if (!userGraphicsPath_.empty())
+            WritePrivateProfileStringA("sprites","depth",spriteBodies_?"1":"0",userGraphicsPath_.c_str());
+        gta2dx9::Log("sprite bodies: %s",spriteBodies_?"stacked":"flat");
+        guideRefreshMs_=0;
+    }
     switch (placement_->TakeEvent()) {
     case PlacementEvent::Opened:
         placementStatus_="Place the ceiling field"; guideRefreshMs_=0;
@@ -618,32 +620,31 @@ void CeilingBridge::DrawPlacementGuide(IDirect3DDevice9* d,Eye eye) {
                 section(leftX,top,L"PLAY FIELD");
                 int y=top+60;
                 row(leftX,y,columnWidth,L"L-Stick",shape_==Shape::Room?L"Move the city":L"Move the field",L""); y+=step;
-                std::swprintf(number,std::size(number),L"%.0f°",s.yaw_radians*180.0/3.141592653589793);
+                std::swprintf(number,std::size(number),L"%.0f deg",s.yaw_radians*180.0/3.141592653589793);
                 row(leftX,y,columnWidth,L"R-Stick",L"Rotate",number); y+=step;
                 std::swprintf(number,std::size(number),L"%.0f cm/block",s.meters_per_tile*100.0);
                 row(leftX,y,columnWidth,L"LB / RB",L"Scale",number); y+=step;
                 row(leftX,y,columnWidth,L"Back",L"Surface",OnFloor()?L"floor":L"ceiling"); y+=step;
-                row(leftX,y,columnWidth,L"D-pad ←→",L"Play field",
+                row(leftX,y,columnWidth,L"D-pad left/right",L"Play field",
                     shape_==Shape::Room?L"whole surface":L"circle"); y+=step;
                 std::swprintf(number,std::size(number),L"%.2f m",circleSize_);
-                row(leftX,y,columnWidth,L"D-pad ↑↓",L"Circle size",shape_==Shape::Circle?number:L"–",
+                row(leftX,y,columnWidth,L"D-pad up/down",L"Circle size",shape_==Shape::Circle?number:L"-",
                     shape_==Shape::Circle); y+=step;
-                row(leftX,y,columnWidth,L"L3+R3 1s",OnFloor()?L"Player below you":L"Player above you",L""); y+=step;
                 row(leftX,y,columnWidth,L"R3 4s",L"Freeze the city",WorldLocked()?L"on":L"off",shape_==Shape::Circle);
                 section(rightX,top,L"DISPLAY");
                 y=top+60;
                 row(rightX,y,columnWidth,L"Start",L"Occlusion",occlusion_?L"on":L"off"); y+=step;
                 std::swprintf(number,std::size(number),L"%.1fx",viewRange_);
                 row(rightX,y,columnWidth,L"Y",L"View range",number); y+=step;
-                row(rightX,y,columnWidth,L"X",L"Holo cut",holoCuts_?L"on":L"off"); y+=step;
-                row(rightX,y,columnWidth,L"RT",L"Controls",modernControls_?L"modern":L"classic");
+                row(rightX,y,columnWidth,L"RT",L"Controls",modernControls_?L"modern":L"classic"); y+=step;
+                row(rightX,y,columnWidth,L"LT",L"Sprite bodies",spriteBodies_?L"stacked":L"flat");
             } else {
                 section(leftX,top,L"FIELD");
                 int y=top+60;
                 row(leftX,y,columnWidth,L"L-Stick",L"Move",L""); y+=step;
                 std::swprintf(number,std::size(number),L"%.2f m",s.distance_m);
                 row(leftX,y,columnWidth,L"R-Stick",L"Height / rotation",number); y+=step;
-                std::swprintf(number,std::size(number),L"%.1f × %.1f m",s.width_m,s.depth_m);
+                std::swprintf(number,std::size(number),L"%.1f x %.1f m",s.width_m,s.depth_m);
                 row(leftX,y,columnWidth,L"D-pad",L"Width / depth",number); y+=step;
                 std::swprintf(number,std::size(number),L"%.0f cm/block",s.meters_per_tile*100.0);
                 row(leftX,y,columnWidth,L"LB / RB",L"Scale",number);

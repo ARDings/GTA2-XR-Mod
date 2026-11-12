@@ -144,6 +144,9 @@ float SpriteLift();
 // emissive can be put on once.
 constexpr bool kDefaultOwnCarLamps = true;
 void SetOwnCarLamps(bool on);
+// GTA2Ceiling: cars and people as stacked sprite bodies (on) or the original
+// flat sprites (off). LT in the headset menu; the ini only gives the default.
+void SetSpriteDepth(bool on);
 // GTA2Ceiling: slab layers per car/person (6 Standard, 12 High-End).
 void SetSpriteDepthLayers(int layers);
 // GTA2Ceiling: soft contact shadows under cars and people.

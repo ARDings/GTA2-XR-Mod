@@ -288,20 +288,9 @@ bool PlacementControls::ConsumeInput(const GamepadState& state, double delta_sec
         return false;
     }
     if (chord_hold_) {
-        // Still holding the opening chord: a long hold means "put the player
-        // above me" rather than manual placement.
-        if ((state.buttons & Chord) == Chord) {
-            if (std::isfinite(delta_seconds))
-                chord_hold_seconds_ += static_cast<float>(std::clamp(delta_seconds, 0.0, 0.25));
-            if (chord_hold_seconds_ >= kRecenterHoldSeconds) {
-                active_ = false;
-                preview_ = committed_;
-                chord_hold_ = false;
-                wait_neutral_ = true;
-                event_ = PlacementEvent::RecenterRequested;
-            }
-            return true;
-        }
+        // Still holding the opening chord: nothing else counts until the
+        // sticks are released (holding them longer no longer does anything).
+        if ((state.buttons & Chord) == Chord) return true;
         chord_hold_ = false;
     }
     if (pressed & B) { Cancel(); return true; } // Cancel wins if both are pressed.

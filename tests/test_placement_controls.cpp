@@ -165,24 +165,15 @@ void TestBoundsAndPersistenceFailure() {
     assert(Near(ClampPlacement(invalid).distance_m,1.6f));
 }
 
-void TestLongChordRecentres() {
+void TestLongChordOnlyOpens() {
     FakeStore store;
     PlacementControls control({}, store);
     GamepadState sample{}; sample.buttons = Chord;
     assert(control.ConsumeInput(sample, 0.01));
     assert(control.Active() && control.TakeEvent() == PlacementEvent::Opened);
-    for (int i = 0; i < 4; ++i) assert(control.ConsumeInput(sample, 0.2));
-    assert(control.Active()); // 0.8 s: still the ordinary placement chord.
-    assert(control.ConsumeInput(sample, 0.25));
-    assert(!control.Active() && control.TakeEvent() == PlacementEvent::RecenterRequested);
-    assert(store.saves == 0);
-    assert(control.SetOffsets(0.7f, -1.2f) && store.saves == 1);
-    assert(Near(control.CommittedSettings().offset_x_m, 0.7f) && Near(store.saved.offset_z_m, -1.2f));
-    assert(control.ConsumeInput(sample, 0.25)); // Held sticks do not reopen placement.
-    assert(!control.Active());
-    assert(control.ConsumeInput({}, 0.01));
-    // A short press followed by release still opens normal placement.
-    assert(control.ConsumeInput(sample, 0.01) && control.Active());
+    for (int i = 0; i < 10; ++i) assert(control.ConsumeInput(sample, 0.25));
+    // Holding the sticks longer only keeps the menu open; nothing else happens.
+    assert(control.Active() && control.TakeEvent() == PlacementEvent::None && store.saves == 0);
     assert(control.ConsumeInput({}, 0.01) && control.Active());
 }
 
@@ -343,7 +334,7 @@ int main() {
     TestMotionTimeAndDiscreteButtons();
     TestBoundsAndPersistenceFailure();
     TestBridgeModalFocusAndDisconnect();
-    TestLongChordRecentres();
+    TestLongChordOnlyOpens();
     TestRealFileStoreAtomicFailureAndProtectedFiles();
     std::cout<<"Placement state, filter and atomic-file tests passed; no headset acceptance.\n";
 }

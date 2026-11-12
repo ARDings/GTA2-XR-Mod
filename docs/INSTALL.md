@@ -10,7 +10,7 @@ Experimental. You need your own GTA2 (version 9.6), a Quest 3 with a room scan (
    sh /sdcard/Download/GTA2Ceiling/gta2/SetupWinlatorShortcut.sh
    ```
    This only writes the container's `GTA2Ceiling` shortcut.
-5. **Controller:** pair the Xbox controller with the Quest and expose it as XInput in the container. Without one, the Touch controllers act as an Xbox pad by themselves (see the [README](../README.md#quest-touch-controllers)).
+5. **Controller:** pair the Xbox controller with the Quest via Bluetooth; it becomes player 1 by itself. The Touch controllers always work as an Xbox pad as well (see the [README](../README.md#quest-touch-controllers)).
 6. **Start** the GTA2Ceiling shortcut and allow room access when asked. Without a valid room scan the game waits and shows a message.
 
 Controls and the in-headset menu: see the [README](../README.md#in-headset-menu). Settings live in `gta2ceiling.ini`.

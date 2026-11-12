@@ -48,11 +48,14 @@ public:
     // How far around the player GTA2 spawns, keeps and draws cars and people,
     // as a multiple of the stock view rectangle (Y in the menu: 1x to 3x).
     float ViewRange() const { return viewRange_; }
-    // X in the menu: buildings cut open by the round field's edge are closed
-    // with a holographic surface on the cut (WorldView::DrawHoloCut). Off by default.
+    // Buildings cut open by the round field's edge closed with a holographic
+    // surface (WorldView::DrawHoloCut). Switched off for now: no menu entry.
     bool HoloCuts() const { return holoCuts_; }
-    // RT in the menu: modern controls (modern_controls.h). Off by default.
+    // RT in the menu: modern controls (modern_controls.h). On by default.
     bool ModernControls() const { return modernControls_; }
+    // LT in the menu: cars and people as stacked sprite bodies, or flat as in
+    // the original. Default from gta2ceiling.ini [sprites] depth.
+    bool SpriteBodies() const { return spriteBodies_; }
     // The user's own options file (gta2ceiling_user_graphics.ini), empty if unknown.
     const std::string& UserOptionsPath() const { return userGraphicsPath_; }
     // The round play field (cut with the six planes of SetCityHexClip).
@@ -123,7 +126,7 @@ private:
     bool poseRefresh_=false;
     bool worldLocked_=false, r3Latched_=false;
     float viewRange_=1.0f;
-    bool holoCuts_=false, modernControls_=false;
+    bool holoCuts_=false, modernControls_=true, spriteBodies_=true;
     GamepadState lastPad_{};
     double r3HeldSeconds_=0;
     int writtenOcclusion_=-1;

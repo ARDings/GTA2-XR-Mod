@@ -58,9 +58,9 @@ The app declares `com.oculus.permission.USE_ANCHOR_API` and asks for `com.oculus
 
 Only a shortcut with `gcc_exact_colour_key=1` switches on the exact key: 8-bit magenta `(255,0,255)` alone becomes transparent, every other colour stays opaque. Winlator's usual wide HSV key and its modes 0 to 4 are unchanged.
 
-Without a physical game controller, the Touch controllers drive a virtual Xbox pad on player 1 (WinlatorXR's gamepad emulation, switched on and off automatically about once a second; mapped keys and mouse emulation are off meanwhile). A connected controller always takes over. WinlatorXR's own menu opens with the left thumbstick held alone, because the right stick press belongs to the game.
+The Touch controllers always drive a virtual Xbox pad on player 1 (WinlatorXR's gamepad emulation; mapped keys and mouse emulation are off). A connected physical controller drives player 1 at the same time: `WinHandler` merges both (buttons combined, each stick from whichever pad moves it further, the stronger trigger). WinlatorXR's own menu opens with the left thumbstick held alone, because the right stick press belongs to the game.
 
-If player 1 is enabled and unassigned, the host assigns exactly one detected Microsoft Xbox controller. With several matching devices, player 1 switched off or an existing assignment, nothing is changed.
+If player 1 is enabled and has no connected controller (nothing assigned, or the assigned one is not there), the host assigns one by itself: the only Xbox controller (by vendor or name), otherwise the only controller. With several candidates nothing changes. With several matching devices, player 1 switched off or an existing assignment, nothing is changed.
 
 ## License and distributing an APK
 

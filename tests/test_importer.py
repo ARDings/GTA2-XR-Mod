@@ -154,7 +154,7 @@ class TestImporter(unittest.TestCase):
         try:
             result = importer.validate_and_import(self.source, self.output)
             self.assertFalse(result["success"])
-            self.assertIn("Links/Junctions", result["error"])
+            self.assertIn("Links/junctions", result["error"])
             self.assertFalse(self.output.exists())
         finally:
             link.rmdir()  # Removes the junction itself, never its target tree.

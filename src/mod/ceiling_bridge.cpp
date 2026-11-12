@@ -508,7 +508,7 @@ bool CeilingBridge::ConsumeController(const GamepadState& state) {
     }
     switch (placement_->TakeEvent()) {
     case PlacementEvent::Opened:
-        placementStatus_="Place the ceiling field"; guideRefreshMs_=0;
+        placementStatus_=roomScanEnabled_?"":"Place the ceiling field"; guideRefreshMs_=0;
         gta2dx9::Log("placement opened; game input captured"); break;
     case PlacementEvent::Committed:
         placementStatus_.clear(); statusUntilMs_=0; guideRefreshMs_=0;  // no toast: back to the game at once
@@ -600,7 +600,7 @@ void CeilingBridge::DrawPlacementGuide(IDirect3DDevice9* d,Eye eye) {
             RECT stripe{10,92,width-10,128}; HBRUSH hb=CreateSolidBrush(header); FillRect(dc,&stripe,hb); DeleteObject(hb);
             const wchar_t* title=!roomScanEnabled_?L"Place the ceiling field":OnFloor()?L"City on the floor":L"City on the ceiling";
             write(titleFont,text,{56,14,width-420,124},title,DT_LEFT);
-            write(sectionFont,accent,{width-420,14,width-56,124},L"GTA2CEILING",DT_RIGHT);
+            write(sectionFont,accent,{width-760,14,width-56,124},L"GTA2 Mod by Christoph Spinger",DT_RIGHT);
             // One row: key chip, description, value (accent; muted when inactive).
             auto row=[&](int x,int y,int columnWidth,const wchar_t* key,const wchar_t* label,
                          const std::wstring& value,bool active=true) {
@@ -625,10 +625,10 @@ void CeilingBridge::DrawPlacementGuide(IDirect3DDevice9* d,Eye eye) {
                 std::swprintf(number,std::size(number),L"%.0f cm/block",s.meters_per_tile*100.0);
                 row(leftX,y,columnWidth,L"LB / RB",L"Scale",number); y+=step;
                 row(leftX,y,columnWidth,L"Back",L"Surface",OnFloor()?L"floor":L"ceiling"); y+=step;
-                row(leftX,y,columnWidth,L"D-pad left/right",L"Play field",
+                row(leftX,y,columnWidth,L"D-pad L/R",L"Play field",
                     shape_==Shape::Room?L"whole surface":L"circle"); y+=step;
                 std::swprintf(number,std::size(number),L"%.2f m",circleSize_);
-                row(leftX,y,columnWidth,L"D-pad up/down",L"Circle size",shape_==Shape::Circle?number:L"-",
+                row(leftX,y,columnWidth,L"D-pad U/D",L"Circle size",shape_==Shape::Circle?number:L"-",
                     shape_==Shape::Circle); y+=step;
                 row(leftX,y,columnWidth,L"R3 4s",L"Freeze the city",WorldLocked()?L"on":L"off",shape_==Shape::Circle);
                 section(rightX,top,L"DISPLAY");

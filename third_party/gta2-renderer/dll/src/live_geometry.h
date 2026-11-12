@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <d3d9.h>
 #include <map>
+#include <utility>
 #include <vector>
 
 #include "../../src/camera.h"
@@ -250,6 +251,9 @@ public:
         freeOn_ = on; freeCameraX_ = cameraX; freeCameraZ_ = cameraZ; freeTracking_ = tracking;
         freePredictedX_ = predictedX; freePredictedZ_ = predictedZ; freeArea_ = area; freeSpeed_ = speed;
     }
+    // Cars drawn outside the disc as well, wherever they are (renderer x, z;
+    // the easter-egg tank). Kept until replaced.
+    void SetFreeExtra(std::vector<std::pair<float, float>> points) { freeExtra_ = std::move(points); }
     // Whether a body sprite (not a lamp, not a token) is centred within reach
     // of (x, z) this game frame. Usable as soon as the game has drawn.
     bool SpriteNear(float x, float z, float reach, FocusInfo* out = nullptr) const;
@@ -337,6 +341,7 @@ private:
     bool freeOn_ = false, freeTracking_ = false, freeReady_ = false, freeFound_ = false, freeSwitched_ = false;
     float freeCameraX_ = 0, freeCameraZ_ = 0, freePredictedX_ = 0, freePredictedZ_ = 0, freeArea_ = 0, freeSpeed_ = 0;
     std::vector<std::pair<float, float>> freePeople_;  // people seen last frame (getting out of a car)
+    std::vector<std::pair<float, float>> freeExtra_;   // see SetFreeExtra
     int freeCount_ = 0;
     FocusInfo freeFocus_{};
     std::vector<uint8_t> freeFlags_;

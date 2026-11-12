@@ -1426,46 +1426,59 @@ void LiveGeometry::PrepareFree() {
         if (!focus) focus = nearest(freePredictedX_, freePredictedZ_, 0.5f, -1);
     }
     freePeople_.swap(people);
-    if (!focus) return;
-    const Sprite& f = *plainDraws_[focus->index].sprite;
-    freeFocus_.x = focus->c[0]; freeFocus_.y = focus->c[1]; freeFocus_.z = focus->c[2];
-    freeFocus_.heading = std::atan2(f.objectToWorld.m[0][2], f.objectToWorld.m[0][0]);
-    freeFocus_.area = focus->area;
-    freeFound_ = true;
-    // Part of the player: its own lamp quads (lying on its footprint) and what
-    // the game stacks exactly on its body (same centre, not larger). Nothing
-    // else - a pedestrian it touches stays inside the disc's clip.
-    float x0 = f.local[0].x, x1 = x0, z0 = f.local[0].z, z1 = z0;
-    for (int i = 1; i < f.corners; ++i) {
-        x0 = (std::min)(x0, f.local[i].x); x1 = (std::max)(x1, f.local[i].x);
-        z0 = (std::min)(z0, f.local[i].z); z1 = (std::max)(z1, f.local[i].z);
-    }
-    const gta2::Mat4& m = f.objectToWorld;
-    const float axisX = m.m[0][0] * m.m[0][0] + m.m[0][1] * m.m[0][1] + m.m[0][2] * m.m[0][2];
-    const float axisZ = m.m[2][0] * m.m[2][0] + m.m[2][1] * m.m[2][1] + m.m[2][2] * m.m[2][2];
-    constexpr float kMargin = 0.08f;
-    for (size_t k = 0; k < plainDraws_.size(); ++k) {
-        if (k == focus->index) { freeFlags_[k] = 1; ++freeCount_; continue; }
-        const Sprite& s = *plainDraws_[k].sprite;
-        if (s.flat || s.corners < 3 || s.corners > 4 || axisX <= 1e-8f || axisZ <= 1e-8f) continue;
-        float c[3];
-        SpriteCentre(s.objectToWorld, s.local, s.corners, c);
-        const float px = c[0] - m.m[3][0], py = c[1] - m.m[3][1], pz = c[2] - m.m[3][2];
-        if (std::fabs(c[1] - freeFocus_.y) > 0.75f) continue;
-        const float lx = (px * m.m[0][0] + py * m.m[0][1] + pz * m.m[0][2]) / axisX;
-        const float lz = (px * m.m[2][0] + py * m.m[2][1] + pz * m.m[2][2]) / axisZ;
-        if (lx < x0 - kMargin || lx > x1 + kMargin || lz < z0 - kMargin || lz > z1 + kMargin) continue;
-        if (!s.lamp) {
-            const float dx = c[0] - freeFocus_.x, dz = c[2] - freeFocus_.z;
-            float sx0 = s.local[0].x, sx1 = sx0, sz0 = s.local[0].z, sz1 = sz0;
-            for (int i = 1; i < s.corners; ++i) {
-                sx0 = (std::min)(sx0, s.local[i].x); sx1 = (std::max)(sx1, s.local[i].x);
-                sz0 = (std::min)(sz0, s.local[i].z); sz1 = (std::max)(sz1, s.local[i].z);
-            }
-            if (dx * dx + dz * dz > 0.15f * 0.15f || (sx1 - sx0) * (sz1 - sz0) > 1.3f * focus->area) continue;
+    // Part of a free car or person: its own lamp quads (lying on its
+    // footprint) and what the game stacks exactly on its body (same centre,
+    // not larger). Nothing else - a pedestrian it touches stays inside the
+    // disc's clip.
+    auto mark = [&](const Candidate& owner) {
+        const Sprite& f = *plainDraws_[owner.index].sprite;
+        float x0 = f.local[0].x, x1 = x0, z0 = f.local[0].z, z1 = z0;
+        for (int i = 1; i < f.corners; ++i) {
+            x0 = (std::min)(x0, f.local[i].x); x1 = (std::max)(x1, f.local[i].x);
+            z0 = (std::min)(z0, f.local[i].z); z1 = (std::max)(z1, f.local[i].z);
         }
-        freeFlags_[k] = 1;
-        ++freeCount_;
+        const gta2::Mat4& m = f.objectToWorld;
+        const float axisX = m.m[0][0] * m.m[0][0] + m.m[0][1] * m.m[0][1] + m.m[0][2] * m.m[0][2];
+        const float axisZ = m.m[2][0] * m.m[2][0] + m.m[2][1] * m.m[2][1] + m.m[2][2] * m.m[2][2];
+        constexpr float kMargin = 0.08f;
+        for (size_t k = 0; k < plainDraws_.size(); ++k) {
+            if (freeFlags_[k]) continue;
+            if (k == owner.index) { freeFlags_[k] = 1; ++freeCount_; continue; }
+            const Sprite& s = *plainDraws_[k].sprite;
+            if (s.flat || s.corners < 3 || s.corners > 4 || axisX <= 1e-8f || axisZ <= 1e-8f) continue;
+            float c[3];
+            SpriteCentre(s.objectToWorld, s.local, s.corners, c);
+            const float px = c[0] - m.m[3][0], py = c[1] - m.m[3][1], pz = c[2] - m.m[3][2];
+            if (std::fabs(c[1] - owner.c[1]) > 0.75f) continue;
+            const float lx = (px * m.m[0][0] + py * m.m[0][1] + pz * m.m[0][2]) / axisX;
+            const float lz = (px * m.m[2][0] + py * m.m[2][1] + pz * m.m[2][2]) / axisZ;
+            if (lx < x0 - kMargin || lx > x1 + kMargin || lz < z0 - kMargin || lz > z1 + kMargin) continue;
+            if (!s.lamp) {
+                const float dx = c[0] - owner.c[0], dz = c[2] - owner.c[2];
+                float sx0 = s.local[0].x, sx1 = sx0, sz0 = s.local[0].z, sz1 = sz0;
+                for (int i = 1; i < s.corners; ++i) {
+                    sx0 = (std::min)(sx0, s.local[i].x); sx1 = (std::max)(sx1, s.local[i].x);
+                    sz0 = (std::min)(sz0, s.local[i].z); sz1 = (std::max)(sz1, s.local[i].z);
+                }
+                if (dx * dx + dz * dz > 0.15f * 0.15f || (sx1 - sx0) * (sz1 - sz0) > 1.3f * owner.area) continue;
+            }
+            freeFlags_[k] = 1;
+            ++freeCount_;
+        }
+    };
+    if (focus) {
+        const Sprite& f = *plainDraws_[focus->index].sprite;
+        freeFocus_.x = focus->c[0]; freeFocus_.y = focus->c[1]; freeFocus_.z = focus->c[2];
+        freeFocus_.heading = std::atan2(f.objectToWorld.m[0][2], f.objectToWorld.m[0][0]);
+        freeFocus_.area = focus->area;
+        freeFound_ = true;
+        mark(*focus);
+    }
+    // Other cars that are always seen outside the disc (the easter-egg tank),
+    // at exactly known positions.
+    for (const auto& point : freeExtra_) {
+        const Candidate* car = nearest(point.first, point.second, 0.6f, 1);
+        if (car && !freeFlags_[car->index]) mark(*car);
     }
 }
 

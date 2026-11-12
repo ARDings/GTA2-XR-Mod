@@ -830,6 +830,7 @@ bool WorldView::EnsureWorldLoaded() {
     Log("level load: begin map=%p thread=%lu", mapObject, GetCurrentThreadId());
     DropWalkOut("new level");
     follow_.clear();
+    tankCar_ = nullptr;
     RecallFollow();
     followRounds_ = 0;
     ceiling_.ReleaseWorld();
@@ -1213,6 +1214,11 @@ void WorldView::UpdateCamera() {
             walkExact_ = exact;
             Log("walk out: the player is %s", exact ? "known exactly (the game's own object)" : "followed by its sprite");
         }
+        // Our tank is seen outside the disc too, driven or not.
+        std::vector<std::pair<float, float>> extra;
+        float tankX = 0, tankY = 0;
+        if (TankPosition(&tankX, &tankY)) extra.emplace_back(tankX, static_cast<float>(gta2::kMapHeight) - tankY);
+        live_.SetFreeExtra(std::move(extra));
         if (exact)
             live_.RequestFree(true, target.x, target.z, true, px, static_cast<float>(gta2::kMapHeight) - py, -1.0f, 0.0f);
         else
@@ -1220,6 +1226,7 @@ void WorldView::UpdateCamera() {
                               walkTrack_.z + walkTrack_.vz, walkTrack_.area, std::hypot(walkTrack_.vx, walkTrack_.vz));
     } else {
         live_.RequestFree(false, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f);
+        live_.SetFreeExtra({});
         walkTrack_ = WalkTrack{};
     }
 
@@ -1893,6 +1900,27 @@ void WorldView::ModernRemap(gta2ceiling::GamepadState& state) {
     }
 }
 
+bool WorldView::TankPosition(float* x, float* y) {
+    if (!tankCar_) return false;
+    // Still in the game's live list and still a tank: the slot may have been
+    // recycled for another car since.
+    PageCache pages;
+    int guard = 0;
+    for (const uint8_t* car = game::VehicleListHead(); car && guard < 400;
+         car = pages.Readable(car, game::kVehicleNext + 4) ? game::NextInList(car, game::kVehicleNext) : nullptr, ++guard) {
+        if (car != tankCar_) continue;
+        if (!pages.Readable(car, game::kVehicleModel + 4) ||
+            ReadAt<int32_t>(car, static_cast<int>(game::kVehicleModel)) != game::kModelTank)
+            break;
+        const uint8_t* place = game::Placement(car, game::kVehiclePlacementPtr);
+        if (place && ObjectCell(place, kFollowSprite, pages, x, y)) return true;
+        break;
+    }
+    tankCar_ = nullptr;
+    Log("tank: no longer in the game");
+    return false;
+}
+
 bool WorldView::FollowedPlayer(float* x, float* y, bool* inCar, float* face) {
     uint8_t* camera = game::CameraStruct();
     if (!game::PlausiblePointer(camera)) return false;
@@ -2124,6 +2152,96 @@ void WorldView::DropWalkOut(const char* why) {
     if (had) Log("walk out: flat ground dropped (%s)", why);
 }
 
+namespace {
+// The game's own car creation, guarded: a fault inside it is caught rather
+// than taking the game down (it is only ever called with the checks in
+// UpdateTankEgg passed, so this is a last line, not the plan).
+void* CreateGameCar(int x, int y, int heading, int model) {
+    using Create = void*(__thiscall*)(void*, int, int, int, int);
+    void* creator = *reinterpret_cast<void**>(game::kCarCreatorPtr);
+    __try {
+        return reinterpret_cast<Create>(game::kCreateCarOnGround)(creator, x, y, heading, model);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Everything that has to hold before the game is asked for a car.
+const char* TankBlocker() {
+    static const bool codeMatches =
+        std::memcmp(reinterpret_cast<const void*>(game::kCreateCarOnGround), game::kCreateCarOnGroundBytes,
+                    sizeof(game::kCreateCarOnGroundBytes)) == 0;
+    if (!codeMatches) return "this gta2.exe is not the one the car creation was read from";
+    const uint8_t* creator = *reinterpret_cast<uint8_t* const*>(game::kCarCreatorPtr);
+    const uint8_t* pool = *reinterpret_cast<uint8_t* const*>(game::kVehiclePoolPtr);
+    if (!game::PlausiblePointer(creator) || !game::PlausiblePointer(pool)) return "no car manager yet";
+    // The free list: the game takes its head without looking, so it must not be empty.
+    if (!game::PlausiblePointer(*reinterpret_cast<const uint8_t* const*>(pool))) return "no free car slot";
+    const uint8_t* style = *reinterpret_cast<uint8_t* const*>(game::kStylePtr);
+    if (!game::PlausiblePointer(style)) return "no style loaded";
+    const uint8_t* const* info = *reinterpret_cast<const uint8_t* const* const*>(style + game::kStyleCarInfo);
+    if (!game::PlausiblePointer(info)) return "no car info in the style";
+    // The records themselves sit packed in the loaded style, so not aligned:
+    // only null (or nonsense) means the model is missing.
+    const uintptr_t tank = reinterpret_cast<uintptr_t>(info[game::kModelTank]);
+    if (tank < 0x00010000 || tank >= 0x7FFE0000) return "this district has no tank";
+    return nullptr;
+}
+}  // namespace
+
+void WorldView::UpdateTankEgg(std::vector<walkout::Point>* around, bool afterTrack) {
+    const uint64_t now = GetTickCount64();
+    if (!afterTrack) {
+        // Where the headset is, in map cells: the eye's view matrix carries the
+        // city's placement, scale and mirror, so its inverse puts the head on the map.
+        if (!tankTried_ && stickViewValid_ && now >= tankLastMs_ + 60000) {
+            tankTried_ = true;
+            gta2::Mat4 toWorld;
+            if (!Invert(stickView_, &toWorld)) return;
+            const float x = toWorld.m[3][0], y = static_cast<float>(gta2::kMapHeight) - toWorld.m[3][2];
+            const float r = ceiling_.FieldRadiusTiles() + 1.5f;
+            const float dx = x - cityCenter_.x, dz = toWorld.m[3][2] - cityCenter_.z;
+            if (x < 3.0f || y < 3.0f || x > gta2::kMapWidth - 3.0f || y > gta2::kMapHeight - 3.0f) {
+                Log("tank: the headset is off the map (%.1f,%.1f); no tank", x, y);
+                return;
+            }
+            if (dx * dx + dz * dz < r * r) {
+                Log("tank: the headset is over the disc; no tank this time");
+                return;
+            }
+            tankX_ = x; tankY_ = y; tankPending_ = true;
+            tankDueMs_ = now + 1500;     // the ground under it is made flat first
+            tankGiveUpMs_ = now + 8000;
+            Log("tank: will appear under the headset at %.1f,%.1f", x, y);
+        }
+        if (tankPending_ || now < tankKeepFlatMs_) around->push_back({tankX_, tankY_});
+        return;
+    }
+    if (!tankPending_ || now < tankDueMs_) return;
+    // Only on ground that is flat for the whole tank and a little more.
+    bool flat = flat_.active && !flat_.mask.empty();
+    for (int dy = -2; flat && dy <= 2; ++dy)
+        for (int dx = -2; flat && dx <= 2; ++dx) {
+            const int cx = static_cast<int>(tankX_) + dx, cy = static_cast<int>(tankY_) + dy;
+            if (cx < 1 || cy < 1 || cx >= gta2::kMapWidth - 1 || cy >= gta2::kMapHeight - 1 ||
+                !flat_.mask[static_cast<size_t>(cy) * gta2::kMapWidth + cx])
+                flat = false;
+        }
+    if (!flat) {
+        if (now >= tankGiveUpMs_) { tankPending_ = false; Log("tank: the ground there never became flat; no tank"); }
+        return;
+    }
+    tankPending_ = false;
+    if (const char* blocker = TankBlocker()) { Log("tank: %s; no tank", blocker); return; }
+    const int fixedX = static_cast<int>(std::lround(tankX_ * 16384.0f));
+    const int fixedY = static_cast<int>(std::lround(tankY_ * 16384.0f));
+    void* tank = CreateGameCar(fixedX, fixedY, 0, game::kModelTank);
+    if (tank) tankCar_ = tank;
+    tankLastMs_ = now;
+    tankKeepFlatMs_ = now + 5000;     // until the walk-out holds the cells under it as a car
+    Log("tank: %s at %.1f,%.1f", tank ? "standing by" : "the game made no car", tankX_, tankY_);
+}
+
 void WorldView::UpdateWalkOut() {
     // Only a window of a few tiles around the player is ever flat (see
     // walk_out.h): flattening everything outside the disc at once hung the game.
@@ -2131,6 +2249,7 @@ void WorldView::UpdateWalkOut() {
     uint8_t* mapObject = game::MapObject();
     if (flat_.active && (mapObject != flatMapObject_ || !worldUploaded_)) DropWalkOut("the map changed");
     const bool locked = ceiling_.WorldLocked() && worldUploaded_ && mapObject && mapObject == loadedMapObject_;
+    if (!locked) { tankTried_ = false; tankPending_ = false; }
     if (!locked && !flat_.active) {
         flatWaitFrames_ = 0;
         flatFailed_ = false;
@@ -2193,9 +2312,11 @@ void WorldView::UpdateWalkOut() {
             return;
         }
         const size_t before = flat_.cells.size();
+        UpdateTankEgg(&around, false);
         walkout::Track(view, flat_, cityCenter_.x, cityCenter_.z, ceiling_.FieldRadiusTiles(), around, kFlatNear, kFlatFar,
                        CarCells(), 1.3f);
         ground_.SetFlat(flat_.mask.data(), static_cast<float>(flat_.level));
+        UpdateTankEgg(&around, true);
         if ((before == 0) != flat_.cells.empty())
             Log("walk out: %s (%zu flat cells around the player at %.1f,%.1f)",
                 flat_.cells.empty() ? "back inside the disc" : "outside the disc", flat_.cells.size(), px, py);

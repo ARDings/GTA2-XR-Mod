@@ -418,6 +418,25 @@ constexpr uintptr_t kVehicleLiveHead = 0x04;
 constexpr uintptr_t kVehicleNext = 0x4C;
 constexpr uintptr_t kVehicleModel = 0x84;   // int32, car model id
 
+// Making a car the way the game itself does: FUN_00426E40, a thiscall on the
+// car creator at [0x005E4CA4] with x and y in 16.14 fixed, a heading in the
+// game's angle units and a model id. It finds the ground height under (x, y)
+// itself (FUN_0046A420), takes a car from the pool's free list without
+// checking it (FUN_004254A0) and returns the car. Scripted and parked cars go
+// through it. Its first bytes are checked before it is ever called, so another
+// gta2.exe never runs into it.
+constexpr uintptr_t kCarCreatorPtr = 0x005E4CA4;
+constexpr uintptr_t kCreateCarOnGround = 0x00426E40;
+constexpr uint8_t kCreateCarOnGroundBytes[12] = {0x53, 0x55, 0x56, 0x8B, 0x74, 0x24,
+                                                 0x1C, 0x57, 0x83, 0xFE, 0x3B, 0x8B};
+// The style's car info per model id: [[0x00670684] + 0x5C][model], null for a
+// model this district's style does not have (FUN_004BF1F0).
+constexpr uintptr_t kStylePtr = 0x00670684;
+constexpr uintptr_t kStyleCarInfo = 0x5C;
+// Model ids as the game's scripts number them (FUN_00426E40 itself singles out
+// the train parts 6, 59, 60 and 61).
+constexpr int kModelTank = 54;
+
 // Which of its deltas the car shows, one bit per delta: dents, doors and lamps.
 // FUN_004be060 reads it through the object at +0x08 (lea edi,[ebp+8]) and, with
 // lighting on, draws the lamp bits as a separate lit quad - the masks it uses

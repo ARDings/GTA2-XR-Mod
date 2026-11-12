@@ -208,6 +208,17 @@ private:
     // Once per game frame from UpdateCamera: flattens the game's map outside
     // the disc while frozen and puts it back afterwards.
     void UpdateWalkOut();
+    // Easter egg: freezing the city puts a tank on the real floor under the
+    // person wearing the headset, outside the disc, for the player to fetch
+    // and drive back into the city. Once per freeze, at most once a minute,
+    // and only through the game's own car creation (see game_access.h).
+    void UpdateTankEgg(std::vector<walkout::Point>* around, bool afterTrack);
+    bool tankTried_ = false, tankPending_ = false;
+    float tankX_ = 0.0f, tankY_ = 0.0f;   // cells, x east, y south
+    uint64_t tankDueMs_ = 0, tankGiveUpMs_ = 0, tankLastMs_ = 0, tankKeepFlatMs_ = 0;
+    // The tank the game made for us, while it is still a live tank (cells).
+    const void* tankCar_ = nullptr;
+    bool TankPosition(float* x, float* y);
     void DropWalkOut(const char* why);
     // After the first eye's sprite pass: follows which sprite is the player.
     void UpdateWalkTrack();
